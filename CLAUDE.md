@@ -108,12 +108,26 @@
 - ピンチ終了後（指を全て離した後）に単指操作を再開するには新たな `pointerdown` が必要
 
 ## ツール
-- Pan / Zoom / Line / Freehand / Oval / Erase
+- Pan / Zoom / Line / Freehand / Oval / Measure / Erase
 - Zoom: 通常クリック=拡大、Alt/Option+クリック=縮小、Space長押し=一時Pan
 - タッチ: 2本指ピンチで拡大縮小
 - Mirror: 全パネル同期で左右反転トグル
 - Hide/Show: アノテーションの表示/非表示トグル（ストロークは保持）
 - Clear: 全アノテーション削除
+
+### Measure ツール（2フェーズ操作）
+- **Phase 1（準備）**: ドラッグで基準線を引く。pointerup で確定（基準長さが決まる）
+- **Phase 2（確定）**: マウス移動でリアルタイムプレビュー。pointerup でクリックした位置まで線を延ばして確定
+- 確定時、基準線の長さ間隔ごとに直交するティックマーク（10スクリーンpx）を描画
+- Phase 1 + Phase 2 が1つのアノテーション = 1回の Undo でまとめて取り消し可能
+- Phase 2 プレビュー中にツールを切り替え or Undo を押すとキャンセル
+- 保存形式: `{ type:'measure', points:[refStart, refEnd, extEnd], color, width }`
+  - `points[0]`: 基準線の始点、`points[1]`: 基準線の終点（= 基準長さの端）、`points[2]`: 延長先
+- `drawMeasureAnnotation`: ティックマーク長 = `10 / view.scale`（image coords）= 常に20スクリーンpx
+- 始点（refStart）と終点（refEnd）にも直交線を描画
+  - Phase 1 プレビュー: AB 方向に対して垂直
+  - Phase 2: AC 方向（メインライン方向）に対して垂直。refEnd が interval と重ならない場合は実際の B 位置にも追加描画
+- Erase ヒット判定: `points[0]` → `points[2]` の線分に対して距離計算
 
 ## デプロイ
 - GitHub Pages、Source は **GitHub Actions** に設定

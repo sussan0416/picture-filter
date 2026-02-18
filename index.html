@@ -92,6 +92,7 @@
     <button id="btnLine" data-tool="line">Line</button>
     <button id="btnFree" data-tool="free">Freehand</button>
     <button id="btnOval" data-tool="oval">Oval</button>
+    <button id="btnMeasure" data-tool="measure">Measure</button>
     <button id="btnErase" data-tool="erase">Erase</button>
   </div>
   <div class="sep"></div>
@@ -219,7 +220,7 @@ function onCvReady() {
 // ---- State ----
 let srcImage = null;
 const view = { x: 0, y: 0, scale: 1 };
-let annotations = []; // {type:'line'|'free', points:[[x,y],...], color, width}
+let annotations = []; // {type:'line'|'free'|'oval'|'measure', points:[[x,y],...], color, width}
 let currentTool = 'pan';
 let drawState = null; // in-progress annotation
 let flippedH = false;
@@ -233,6 +234,7 @@ const panelBC = [
 let soloPanel = null; // null = grid view, 0-5 = solo panel index
 let annotationsVisible = true;
 let isErasing = false;
+let measureState = null; // {refStart, refEnd, color, width} — between phase 1 and phase 2
 
 const panels = [];
 const canvases = [];
@@ -507,12 +509,80 @@ function drawPanel(idx) {
   ctx.restore();
 }
 
+function drawMeasureAnnotation(ctx, a) {
+  if (a.points.length < 2) return;
+  const [ax, ay] = a.points[0];
+  const [bx, by] = a.points[1];
+  const refLen = Math.hypot(bx - ax, by - ay);
+  // Phase 2 has a 3rd point (extEnd); phase 1 preview ends at refEnd
+  const [cx, cy] = a.points.length >= 3 ? a.points[2] : a.points[1];
+
+  // Draw main line
+  ctx.beginPath();
+  ctx.moveTo(ax, ay);
+  ctx.lineTo(cx, cy);
+  ctx.stroke();
+
+  if (refLen < 0.5) return;
+  const tickHalf = 10 / view.scale; // 20px total in screen space
+
+  if (a.points.length < 3) {
+    // Phase 1 preview: ticks at refStart and refEnd, perpendicular to AB
+    const ux = (bx - ax) / refLen, uy = (by - ay) / refLen;
+    const perpX = -uy, perpY = ux;
+    for (const [px, py] of [[ax, ay], [bx, by]]) {
+      ctx.beginPath();
+      ctx.moveTo(px - perpX * tickHalf, py - perpY * tickHalf);
+      ctx.lineTo(px + perpX * tickHalf, py + perpY * tickHalf);
+      ctx.stroke();
+    }
+    return;
+  }
+
+  // Phase 2: ticks perpendicular to the main line (AC)
+  const dx = cx - ax, dy = cy - ay;
+  const totalLen = Math.hypot(dx, dy);
+  if (totalLen < 0.5) return;
+  const ux = dx / totalLen, uy = dy / totalLen;
+  const perpX = -uy, perpY = ux;
+
+  // Tick at refStart (A)
+  ctx.beginPath();
+  ctx.moveTo(ax - perpX * tickHalf, ay - perpY * tickHalf);
+  ctx.lineTo(ax + perpX * tickHalf, ay + perpY * tickHalf);
+  ctx.stroke();
+
+  // Tick at actual refEnd (B), plus extension ticks at every refLen interval
+  const numTicks = Math.floor(totalLen / refLen);
+  for (let n = 1; n <= numTicks; n++) {
+    const t = n * refLen;
+    const tx = ax + ux * t;
+    const ty = ay + uy * t;
+    ctx.beginPath();
+    ctx.moveTo(tx - perpX * tickHalf, ty - perpY * tickHalf);
+    ctx.lineTo(tx + perpX * tickHalf, ty + perpY * tickHalf);
+    ctx.stroke();
+  }
+  // Tick at actual B (refEnd) if it doesn't coincide with an interval tick
+  const tB = (bx - ax) * ux + (by - ay) * uy; // projection of B onto AC
+  if (Math.abs(tB % refLen) > 0.5 && tB > 0.5 && tB < totalLen - 0.5) {
+    ctx.beginPath();
+    ctx.moveTo(bx - perpX * tickHalf, by - perpY * tickHalf);
+    ctx.lineTo(bx + perpX * tickHalf, by + perpY * tickHalf);
+    ctx.stroke();
+  }
+}
+
 function drawAnnotation(ctx, a) {
   if (a.points.length < 1) return;
   ctx.strokeStyle = a.color;
   ctx.lineWidth = a.width / view.scale;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
+  if (a.type === 'measure') {
+    drawMeasureAnnotation(ctx, a);
+    return;
+  }
   ctx.beginPath();
   if (a.type === 'oval') {
     if (a.points.length < 2) return;
@@ -550,7 +620,10 @@ function eraseAnnotationAt(ix, iy) {
     const hitTol = a.width / 2 / view.scale + extraTol;
     const pts = a.points;
     let dist;
-    if (a.type === 'oval' && pts.length >= 2) {
+    if (a.type === 'measure' && pts.length >= 3) {
+      // Main line runs from pts[0] (refStart) to pts[2] (extEnd)
+      dist = pointToSegmentDist(ix, iy, pts[0][0], pts[0][1], pts[2][0], pts[2][1]);
+    } else if (a.type === 'oval' && pts.length >= 2) {
       const cx = (pts[0][0] + pts[1][0]) / 2, cy = (pts[0][1] + pts[1][1]) / 2;
       const rx = Math.abs(pts[1][0] - pts[0][0]) / 2, ry = Math.abs(pts[1][1] - pts[0][1]) / 2;
       if (rx > 0 && ry > 0) {
@@ -1118,6 +1191,7 @@ function updateGridCursor() {
     case 'line':  grid.style.cursor = 'crosshair'; break;
     case 'free':  grid.style.cursor = 'crosshair'; break;
     case 'oval':  grid.style.cursor = 'crosshair'; break;
+    case 'measure': grid.style.cursor = 'crosshair'; break;
     case 'erase': grid.style.cursor = 'cell'; break;
     default:     grid.style.cursor = 'default';
   }
@@ -1158,13 +1232,26 @@ document.querySelectorAll('#toolbar button[data-tool]').forEach(btn => {
     document.querySelectorAll('#toolbar button[data-tool]').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     currentTool = btn.dataset.tool;
+    // Cancel in-progress measurement when switching away from Measure tool
+    if (currentTool !== 'measure' && (measureState || (drawState && drawState.type === 'measure'))) {
+      measureState = null;
+      drawState = null;
+      renderView();
+    }
     updateGridCursor();
   });
 });
 
 document.getElementById('btnUndo').addEventListener('click', () => {
-  annotations.pop();
-  renderAll();
+  if (measureState || (drawState && drawState.type === 'measure')) {
+    // Cancel in-progress measurement
+    measureState = null;
+    drawState = null;
+    renderView();
+  } else {
+    annotations.pop();
+    renderAll();
+  }
 });
 document.getElementById('btnClearAnnot').addEventListener('click', () => {
   annotations = [];
@@ -1242,6 +1329,15 @@ for (let i = 0; i < PANEL_COUNT; i++) {
       isErasing = true;
       const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
       if (eraseAnnotationAt(ix, iy)) renderView();
+    } else if (tool === 'measure') {
+      if (!measureState) {
+        // Phase 1: start drawing the reference line
+        const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
+        const color = document.getElementById('annotColor').value;
+        const width = parseInt(document.getElementById('annotWidth').value);
+        drawState = { type: 'measure', points: [[ix, iy], [ix, iy]], color, width };
+      }
+      // Phase 2: pointer down does nothing — pointerup will confirm
     } else {
       const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
       const color = document.getElementById('annotColor').value;
@@ -1286,9 +1382,19 @@ for (let i = 0; i < PANEL_COUNT; i++) {
     } else if (isErasing) {
       const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
       if (eraseAnnotationAt(ix, iy)) renderView();
+    } else if (measureState) {
+      // Phase 2: show live preview of the extended measurement
+      const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
+      drawState = {
+        type: 'measure',
+        points: [measureState.refStart, measureState.refEnd, [ix, iy]],
+        color: measureState.color,
+        width: measureState.width,
+      };
+      renderView();
     } else if (drawState) {
       const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
-      if (drawState.type === 'line' || drawState.type === 'oval') {
+      if (drawState.type === 'line' || drawState.type === 'oval' || drawState.type === 'measure') {
         drawState.points[1] = [ix, iy];
       } else {
         drawState.points.push([ix, iy]);
@@ -1309,15 +1415,42 @@ for (let i = 0; i < PANEL_COUNT; i++) {
       isZooming = false;
     } else if (isErasing) {
       isErasing = false;
+    } else if (measureState) {
+      // Phase 2: confirm the extended measurement
+      const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
+      annotations.push({
+        type: 'measure',
+        points: [measureState.refStart, measureState.refEnd, [ix, iy]],
+        color: measureState.color,
+        width: measureState.width,
+      });
+      measureState = null;
+      drawState = null;
+      renderView();
     } else if (drawState) {
       const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
-      if (drawState.type === 'line' || drawState.type === 'oval') {
+      if (drawState.type === 'measure') {
+        // Phase 1 complete: reference line is set
         drawState.points[1] = [ix, iy];
+        const [ax, ay] = drawState.points[0];
+        const [bx, by] = drawState.points[1];
+        const refLen = Math.hypot(bx - ax, by - ay);
+        if (refLen > 0.5) {
+          measureState = { refStart: [ax, ay], refEnd: [bx, by], color: drawState.color, width: drawState.width };
+          // Keep drawState so the reference line remains visible before first mousemove
+          drawState = { type: 'measure', points: [[ax, ay], [bx, by]], color: measureState.color, width: measureState.width };
+        } else {
+          drawState = null;
+        }
+      } else if (drawState.type === 'line' || drawState.type === 'oval') {
+        drawState.points[1] = [ix, iy];
+        if (drawState.points.length >= 2) annotations.push(drawState);
+        drawState = null;
       } else {
         drawState.points.push([ix, iy]);
+        if (drawState.points.length >= 2) annotations.push(drawState);
+        drawState = null;
       }
-      if (drawState.points.length >= 2) annotations.push(drawState);
-      drawState = null;
       renderView();
     }
   });
