@@ -983,6 +983,7 @@ function enterSolo(idx) {
     btn.title = i === idx ? 'グリッドビューに戻る' : '単体表示';
   });
   resizeCanvases();
+  resetView(); renderAll();
 }
 
 function exitSolo() {
@@ -994,6 +995,7 @@ function exitSolo() {
     btn.title = '単体表示';
   });
   resizeCanvases();
+  resetView(); renderAll();
 }
 
 // ---- Controls ----
