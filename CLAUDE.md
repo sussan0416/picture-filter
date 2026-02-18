@@ -62,10 +62,17 @@
 - フィルタキャッシュは `filterResults[6]` に保持、パラメータ変更時に `invalidateFilter(idx)` で個別無効化
 
 ### 単体表示（Solo view）
-- `soloPanel`（null or 0〜5）で状態管理
+- `soloPanel`（null or 0〜5）で状態管理、`soloTransitioning` フラグで遷移中の二重操作を防止
 - `enterSolo(idx)` / `exitSolo()` で切り替え
 - CSS: `#grid.solo .panel:not(.solo-active) { display: none }` + `grid-column: 1/4; grid-row: 1/3` でフル展開
+- CSS: `.panel` に `transition: opacity 0.2s ease, transform 0.2s ease` を設定
+- **アニメーション（2フェーズ、合計約400ms）**:
+  - **enterSolo**: 全パネルを opacity:0 にフェードアウト（200ms） → ソロレイアウト適用 + `resizeCanvases/resetView/renderAll` → ソロパネルを `scale(0.97)→scale(1)` + フェードインで展開演出（200ms）
+  - **exitSolo**: ソロパネルをフェードアウト（200ms） → グリッドレイアウト復帰 + 全パネルリサイズ・再レンダー → 全パネルをフェードイン（200ms）
+  - フェードアウト中は全パネルに `pointer-events: none` を設定し誤操作を防止
+  - `style.transition = 'none'` で一時的にトランジションを無効化してから初期状態をセット → `getBoundingClientRect()` で reflow 強制 → `style.transition = ''` で CSS 定義のトランジションを再有効化してアニメーション開始
 - 切り替え時に `resizeCanvases()` → `resetView()` → `renderAll()` の順で呼び出し、キャンバスリサイズ後に自動 Fit Image
+- `SOLO_FADE_MS = 200`（各フェーズの継続時間）
 
 ### Fit Image（旧 Reset View）
 - `resetView()` は常に表示中のパネルサイズを基準にする

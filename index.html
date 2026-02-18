@@ -36,6 +36,7 @@
 
   .panel {
     position: relative; overflow: hidden; background: #16213e;
+    transition: opacity 0.2s ease, transform 0.2s ease;
   }
   .panel-header {
     position: absolute; top: 0; left: 0; right: 0; z-index: 10;
@@ -232,6 +233,8 @@ const panelBC = [
 ];
 
 let soloPanel = null; // null = grid view, 0-5 = solo panel index
+let soloTransitioning = false;
+const SOLO_FADE_MS = 200;
 let annotationsVisible = true;
 let isErasing = false;
 let measureState = null; // {refStart, refEnd, color, width} — between phase 1 and phase 2
@@ -1085,27 +1088,79 @@ function computeReduceColorJS(w, h, k) {
 
 // ---- Solo view ----
 function enterSolo(idx) {
-  soloPanel = idx;
-  document.getElementById('grid').classList.add('solo');
-  panels.forEach((p, i) => p.classList.toggle('solo-active', i === idx));
+  if (soloTransitioning) return;
+  soloTransitioning = true;
+
   document.querySelectorAll('.btn-expand').forEach((btn, i) => {
     btn.textContent = i === idx ? '✕' : '⛶';
     btn.title = i === idx ? 'グリッドビューに戻る' : '単体表示';
   });
-  resizeCanvases();
-  resetView(); renderAll();
+
+  // Phase 1: fade out all panels to hide the layout jump
+  panels.forEach(p => { p.style.pointerEvents = 'none'; p.style.opacity = '0'; });
+
+  setTimeout(() => {
+    soloPanel = idx;
+    document.getElementById('grid').classList.add('solo');
+    panels.forEach((p, i) => p.classList.toggle('solo-active', i === idx));
+    resizeCanvases();
+    resetView();
+    renderAll();
+
+    // Phase 2: animate solo panel in with scale + fade
+    const p = panels[idx];
+    p.style.transition = 'none';
+    p.style.transform = 'scale(0.97)';
+    // opacity stays 0 from phase 1
+    void p.getBoundingClientRect(); // force reflow before re-enabling transition
+    p.style.transition = '';
+    p.style.opacity = '1';
+    p.style.transform = '';
+
+    setTimeout(() => {
+      p.style.pointerEvents = '';
+      soloTransitioning = false;
+    }, SOLO_FADE_MS);
+  }, SOLO_FADE_MS);
 }
 
 function exitSolo() {
-  soloPanel = null;
-  document.getElementById('grid').classList.remove('solo');
-  panels.forEach(p => p.classList.remove('solo-active'));
-  document.querySelectorAll('.btn-expand').forEach(btn => {
-    btn.textContent = '⛶';
-    btn.title = '単体表示';
-  });
-  resizeCanvases();
-  resetView(); renderAll();
+  if (soloTransitioning) return;
+  soloTransitioning = true;
+
+  const prevIdx = soloPanel;
+  panels[prevIdx].style.pointerEvents = 'none';
+  panels[prevIdx].style.opacity = '0';
+
+  setTimeout(() => {
+    soloPanel = null;
+    document.getElementById('grid').classList.remove('solo');
+    panels.forEach(p => {
+      p.classList.remove('solo-active');
+      p.style.transition = 'none';
+      p.style.opacity = '0';
+      p.style.pointerEvents = 'none';
+    });
+    document.querySelectorAll('.btn-expand').forEach(btn => {
+      btn.textContent = '⛶';
+      btn.title = '単体表示';
+    });
+    resizeCanvases();
+    resetView();
+    renderAll();
+
+    // Phase 2: fade in all panels
+    void document.getElementById('grid').getBoundingClientRect(); // force reflow
+    panels.forEach(p => {
+      p.style.transition = '';
+      p.style.opacity = '1';
+    });
+
+    setTimeout(() => {
+      panels.forEach(p => { p.style.pointerEvents = ''; });
+      soloTransitioning = false;
+    }, SOLO_FADE_MS);
+  }, SOLO_FADE_MS);
 }
 
 // ---- Controls ----
