@@ -33,7 +33,7 @@ jobs:
           curl -L -o opencv-docs.zip "https://github.com/opencv/opencv/releases/download/${LATEST}/opencv-${LATEST}-docs.zip"
 
           # Extract only opencv.js and clean up
-          unzip -j opencv-docs.zip "*/js/bin/opencv.js" -d .
+          unzip -j opencv-docs.zip "js/bin/opencv.js" -d .
           rm opencv-docs.zip
           ls -lh opencv.js
 
