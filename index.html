@@ -180,7 +180,8 @@ function onCvReady() {
   el.textContent = 'OpenCV.js ready';
   el.className = 'ready';
   setTimeout(() => el.style.display = 'none', 2000);
-  invalidateFilter(4);
+  workingMip = -1; // force working data recompute using CV
+  invalidateAllFilters();
   if (srcImage) scheduleRender();
 }
 
@@ -290,14 +291,34 @@ function ensureWorkingData() {
   workingCanvas.width = w;
   workingCanvas.height = h;
   const ctx = workingCanvas.getContext('2d');
-  ctx.drawImage(srcImage, 0, 0, w, h);
 
-  // Compute grayscale at working resolution
-  const id = ctx.getImageData(0, 0, w, h);
-  const d = id.data;
-  workingGray = new Uint8Array(w * h);
-  for (let i = 0; i < workingGray.length; i++) {
-    workingGray[i] = Math.round(0.299 * d[i*4] + 0.587 * d[i*4+1] + 0.114 * d[i*4+2]);
+  if (cvReady && mip < 1) {
+    // OpenCV INTER_AREA: area-based downsampling (higher quality than browser bilinear)
+    // + CV grayscale extraction in the same pass
+    const tmp = document.createElement('canvas');
+    tmp.width = srcImage.width; tmp.height = srcImage.height;
+    tmp.getContext('2d').drawImage(srcImage, 0, 0);
+    const fullData = tmp.getContext('2d').getImageData(0, 0, srcImage.width, srcImage.height);
+    const full = cv.matFromImageData(fullData);
+    const dst = new cv.Mat();
+    const gray = new cv.Mat();
+    try {
+      cv.resize(full, dst, new cv.Size(w, h), 0, 0, cv.INTER_AREA);
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(dst.data), w, h), 0, 0);
+      cv.cvtColor(dst, gray, cv.COLOR_RGBA2GRAY);
+      workingGray = new Uint8Array(gray.data);
+    } finally {
+      full.delete(); dst.delete(); gray.delete();
+    }
+  } else {
+    // Fallback: browser GPU resampling + JS grayscale (also used for mip === 1, no resize)
+    ctx.drawImage(srcImage, 0, 0, w, h);
+    const id = ctx.getImageData(0, 0, w, h);
+    const d = id.data;
+    workingGray = new Uint8Array(w * h);
+    for (let i = 0; i < workingGray.length; i++) {
+      workingGray[i] = Math.round(0.299 * d[i*4] + 0.587 * d[i*4+1] + 0.114 * d[i*4+2]);
+    }
   }
 
   // Working data changed → all filter caches are stale
@@ -393,34 +414,46 @@ function drawAnnotation(ctx, a) {
 // ---- Filter computation (at working resolution) ----
 function computeFilter(idx) {
   const w = workingCanvas.width, h = workingCanvas.height;
-  const c = document.createElement('canvas');
-  c.width = w; c.height = h;
-  const ctx = c.getContext('2d');
 
   if (idx === 1) {
     // Grayscale
-    const id = ctx.createImageData(w, h);
-    const d = id.data;
+    if (cvReady) return computeGrayscaleCV(w, h);
+    // JS fallback
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    const id = ctx.createImageData(w, h); const d = id.data;
     for (let i = 0; i < workingGray.length; i++) {
       const v = workingGray[i];
       d[i*4] = v; d[i*4+1] = v; d[i*4+2] = v; d[i*4+3] = 255;
     }
     ctx.putImageData(id, 0, 0);
-  } else if (idx === 2) {
+    return c;
+  }
+
+  if (idx === 2) {
     // Binary
     const thresh = parseInt(document.getElementById('binThresh').value);
-    const id = ctx.createImageData(w, h);
-    const d = id.data;
+    if (cvReady) return computeBinaryCV(w, h, thresh);
+    // JS fallback
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    const id = ctx.createImageData(w, h); const d = id.data;
     for (let i = 0; i < workingGray.length; i++) {
       const v = workingGray[i] >= thresh ? 255 : 0;
       d[i*4] = v; d[i*4+1] = v; d[i*4+2] = v; d[i*4+3] = 255;
     }
     ctx.putImageData(id, 0, 0);
-  } else if (idx === 3) {
+    return c;
+  }
+
+  if (idx === 3) {
     // Edge (Sobel)
     const thresh = parseInt(document.getElementById('edgeThresh').value);
-    const id = ctx.createImageData(w, h);
-    const d = id.data;
+    if (cvReady) return computeEdgeCV(w, h, thresh);
+    // JS fallback
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    const id = ctx.createImageData(w, h); const d = id.data;
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         let gx = 0, gy = 0;
@@ -436,19 +469,26 @@ function computeFilter(idx) {
       }
     }
     ctx.putImageData(id, 0, 0);
-  } else if (idx === 4) {
+    return c;
+  }
+
+  if (idx === 4) {
     // Blur
     const type = document.getElementById('blurType').value;
     const radius = parseInt(document.getElementById('blurRadius').value);
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
     ctx.drawImage(workingCanvas, 0, 0);
     applyBlur(ctx, w, h, radius, type);
-  } else if (idx === 5) {
-    // Reduce Color (k-means)
-    const k = parseInt(document.getElementById('reduceColors').value);
-    return applyReduceColor(w, h, k);
+    return c;
   }
 
-  return c;
+  if (idx === 5) {
+    // Reduce Color (k-means)
+    const k = parseInt(document.getElementById('reduceColors').value);
+    if (cvReady) return computeReduceColorCV(w, h, k);
+    return computeReduceColorJS(w, h, k);
+  }
 }
 
 function getFilterKey(idx) {
@@ -457,6 +497,80 @@ function getFilterKey(idx) {
   if (idx === 4) return document.getElementById('blurType').value + '_' + document.getElementById('blurRadius').value;
   if (idx === 5) return document.getElementById('reduceColors').value;
   return '';
+}
+
+// ---- Grayscale (OpenCV with JS fallback) ----
+function computeGrayscaleCV(w, h) {
+  const imgData = workingCanvas.getContext('2d').getImageData(0, 0, w, h);
+  const src = cv.matFromImageData(imgData);
+  const gray = new cv.Mat();
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    const n = w * h;
+    const d = new Uint8ClampedArray(n * 4);
+    const gd = gray.data;
+    for (let i = 0; i < n; i++) {
+      const v = gd[i];
+      d[i*4] = v; d[i*4+1] = v; d[i*4+2] = v; d[i*4+3] = 255;
+    }
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    c.getContext('2d').putImageData(new ImageData(d, w, h), 0, 0);
+    return c;
+  } finally {
+    src.delete(); gray.delete();
+  }
+}
+
+// ---- Binary (OpenCV with JS fallback) ----
+function computeBinaryCV(w, h, thresh) {
+  const imgData = workingCanvas.getContext('2d').getImageData(0, 0, w, h);
+  const src = cv.matFromImageData(imgData);
+  const gray = new cv.Mat();
+  const binary = new cv.Mat();
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.threshold(gray, binary, thresh, 255, cv.THRESH_BINARY);
+    const n = w * h;
+    const d = new Uint8ClampedArray(n * 4);
+    const bd = binary.data;
+    for (let i = 0; i < n; i++) {
+      const v = bd[i];
+      d[i*4] = v; d[i*4+1] = v; d[i*4+2] = v; d[i*4+3] = 255;
+    }
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    c.getContext('2d').putImageData(new ImageData(d, w, h), 0, 0);
+    return c;
+  } finally {
+    src.delete(); gray.delete(); binary.delete();
+  }
+}
+
+// ---- Edge / Sobel (OpenCV with JS fallback) ----
+function computeEdgeCV(w, h, thresh) {
+  const imgData = workingCanvas.getContext('2d').getImageData(0, 0, w, h);
+  const src = cv.matFromImageData(imgData);
+  const gray = new cv.Mat();
+  const gx = new cv.Mat();
+  const gy = new cv.Mat();
+  const mag = new cv.Mat();
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.Sobel(gray, gx, cv.CV_32F, 1, 0, 3);
+    cv.Sobel(gray, gy, cv.CV_32F, 0, 1, 3);
+    cv.magnitude(gx, gy, mag);
+    const n = w * h;
+    const magF = mag.data32F;
+    const d = new Uint8ClampedArray(n * 4);
+    for (let i = 0; i < n; i++) {
+      const v = magF[i] > thresh ? Math.min(255, Math.round(magF[i])) : 0;
+      d[i*4] = v; d[i*4+1] = v; d[i*4+2] = v; d[i*4+3] = 255;
+    }
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    c.getContext('2d').putImageData(new ImageData(d, w, h), 0, 0);
+    return c;
+  } finally {
+    src.delete(); gray.delete(); gx.delete(); gy.delete(); mag.delete();
+  }
 }
 
 // ---- Blur (OpenCV.js with JS fallback) ----
@@ -500,7 +614,7 @@ function applyBlurCV(ctx, w, h, radius, type) {
   }
 }
 
-// Simple JS fallback (Gaussian only) used while OpenCV is loading
+// JS Gaussian fallback used while OpenCV is loading
 function applyBlurFallback(ctx, w, h, radius) {
   const id = ctx.getImageData(0, 0, w, h);
   const src = new Uint8ClampedArray(id.data);
@@ -544,8 +658,51 @@ function applyBlurFallback(ctx, w, h, radius) {
   ctx.putImageData(id, 0, 0);
 }
 
-// ---- Reduce Color (k-means) ----
-function applyReduceColor(w, h, k) {
+// ---- Reduce Color (OpenCV k-means with JS fallback) ----
+function computeReduceColorCV(w, h, k) {
+  const n = w * h;
+  const imgData = workingCanvas.getContext('2d').getImageData(0, 0, w, h);
+  const src = cv.matFromImageData(imgData);
+  const src3 = new cv.Mat();
+  const kmeansData = new cv.Mat(n, 3, cv.CV_32F);
+  const labels = new cv.Mat();
+  const centers = new cv.Mat();
+  try {
+    cv.cvtColor(src, src3, cv.COLOR_RGBA2RGB);
+    // Copy RGB pixels into float mat (n rows × 3 cols) for kmeans
+    const rgb = src3.data;
+    const kd = kmeansData.data32F;
+    for (let i = 0; i < n * 3; i++) kd[i] = rgb[i];
+
+    const criteria = new cv.TermCriteria(
+      cv.TermCriteria_EPS + cv.TermCriteria_MAX_ITER, 10, 1.0
+    );
+    cv.kmeans(kmeansData, k, labels, criteria, 1, cv.KMEANS_PP_CENTERS, centers);
+
+    const labelsI = labels.data32S;
+    const centersF = centers.data32F;
+    const out = document.createElement('canvas');
+    out.width = w; out.height = h;
+    const ctx = out.getContext('2d');
+    const outId = ctx.createImageData(w, h);
+    const d = outId.data;
+    for (let i = 0; i < n; i++) {
+      const ci = labelsI[i];
+      d[i*4]   = Math.round(centersF[ci*3]);
+      d[i*4+1] = Math.round(centersF[ci*3+1]);
+      d[i*4+2] = Math.round(centersF[ci*3+2]);
+      d[i*4+3] = 255;
+    }
+    ctx.putImageData(outId, 0, 0);
+    return out;
+  } finally {
+    src.delete(); src3.delete(); kmeansData.delete();
+    if (!labels.isDeleted()) labels.delete();
+    if (!centers.isDeleted()) centers.delete();
+  }
+}
+
+function computeReduceColorJS(w, h, k) {
   const n = w * h;
   const srcCtx = workingCanvas.getContext('2d');
   const srcId = srcCtx.getImageData(0, 0, w, h);
