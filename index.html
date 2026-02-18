@@ -551,20 +551,19 @@ function drawMeasureAnnotation(ctx, a) {
   ctx.lineTo(cx, cy);
   ctx.stroke();
 
-  // Forward ticks: A (n=0), intervals n=1..numTicks, plus actual B if off-grid
+  // Forward ticks: A (n=0), intervals n=1..numTicks (skip if at extEnd), plus actual B if off-grid
   drawTick(ax, ay, perpX, perpY);
   for (let n = 1; n <= numTicks; n++) {
-    drawTick(ax + ux * n * refLen, ay + uy * n * refLen, perpX, perpY);
+    const t = n * refLen;
+    if (totalLen - t < 0.5) continue; // coincides with extEnd — skip
+    drawTick(ax + ux * t, ay + uy * t, perpX, perpY);
   }
-  const tB = (bx - ax) * ux + (by - ay) * uy;
-  if (Math.abs(tB % refLen) > 0.5 && tB > 0.5 && tB < totalLen - 0.5) {
-    drawTick(bx, by, perpX, perpY);
-  }
-
   // Backward ticks if bidirectional: symmetric intervals + backward endpoint
   if (a.bidirectional) {
     for (let n = 1; n <= numTicks; n++) {
-      drawTick(ax - ux * n * refLen, ay - uy * n * refLen, perpX, perpY);
+      const t = n * refLen;
+      if (totalLen - t < 0.5) continue; // coincides with backward endpoint — skip
+      drawTick(ax - ux * t, ay - uy * t, perpX, perpY);
     }
     drawTick(startX, startY, perpX, perpY);
   }

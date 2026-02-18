@@ -126,7 +126,7 @@
 - `drawMeasureAnnotation`: ティックマーク長 = `10 / view.scale`（image coords）= 常に20スクリーンpx
 - 始点（refStart）と終点（refEnd）にも直交線を描画
   - Phase 1 プレビュー: AB 方向に対して垂直
-  - Phase 2: AC 方向（メインライン方向）に対して垂直。refEnd が interval と重ならない場合は実際の B 位置にも追加描画
+  - Phase 2: AC 方向（メインライン方向）に対して垂直。interval ティックのみ（実際の B 位置には描画しない）
 - **bidirectional モード**: Phase 2 確定時に Option/Alt を押しながら pointerup → 始点から逆方向にも同じ長さで線・ティックを延長
   - `bidirectional: true` フラグをアノテーションに保存
   - Phase 2 pointermove でも `altHeld` によりリアルタイムプレビュー更新
