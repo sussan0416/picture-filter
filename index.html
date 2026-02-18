@@ -93,6 +93,7 @@
   <button id="btnUndo">Undo</button>
   <button id="btnClearAnnot">Clear Annotations</button>
   <div class="sep"></div>
+  <button id="btnFlipH">Flip H</button>
   <button id="btnResetView">Reset View</button>
 </div>
 
@@ -189,6 +190,7 @@ const view = { x: 0, y: 0, scale: 1 };
 let annotations = []; // {type:'line'|'free', points:[[x,y],...], color, width}
 let currentTool = 'pan';
 let drawState = null; // in-progress annotation
+let flippedH = false;
 
 const panels = [];
 const canvases = [];
@@ -350,6 +352,10 @@ function drawPanel(idx) {
   ctx.clearRect(0, 0, rect.width, rect.height);
 
   ctx.save();
+  if (flippedH) {
+    ctx.translate(rect.width, 0);
+    ctx.scale(-1, 1);
+  }
   ctx.translate(view.x, view.y);
   ctx.scale(view.scale, view.scale);
 
@@ -657,6 +663,11 @@ document.getElementById('reduceColors').addEventListener('input', e => {
   invalidateFilter(5);
   scheduleRender();
 });
+document.getElementById('btnFlipH').addEventListener('click', () => {
+  flippedH = !flippedH;
+  document.getElementById('btnFlipH').classList.toggle('active', flippedH);
+  renderView();
+});
 document.getElementById('btnResetView').addEventListener('click', () => { resetView(); renderAll(); });
 
 // ---- Cursor management ----
@@ -759,15 +770,17 @@ let isZooming = false; // zoom tool drag state
 
 function screenToImage(sx, sy, panelEl) {
   const rect = panelEl.getBoundingClientRect();
-  const lx = sx - rect.left;
+  let lx = sx - rect.left;
   const ly = sy - rect.top;
+  if (flippedH) lx = rect.width - lx;
   return [(lx - view.x) / view.scale, (ly - view.y) / view.scale];
 }
 
 function applyZoom(clientX, clientY, panelEl, zoomIn) {
   const rect = panelEl.getBoundingClientRect();
-  const mx = clientX - rect.left;
+  let mx = clientX - rect.left;
   const my = clientY - rect.top;
+  if (flippedH) mx = rect.width - mx;
   const factor = zoomIn ? 1.5 : 1 / 1.5;
   const newScale = view.scale * factor;
   view.x = mx - (mx - view.x) * (newScale / view.scale);
@@ -789,7 +802,7 @@ for (let i = 0; i < PANEL_COUNT; i++) {
 
     if (tool === 'pan') {
       isPanning = true;
-      panStart = { x: e.clientX - view.x, y: e.clientY - view.y };
+      panStart = { x: (flippedH ? -e.clientX : e.clientX) - view.x, y: e.clientY - view.y };
       updateGridCursor();
     } else if (tool === 'zoom') {
       // Click to zoom in/out instantly
@@ -807,7 +820,7 @@ for (let i = 0; i < PANEL_COUNT; i++) {
   canvas.addEventListener('pointermove', e => {
     if (!srcImage) return;
     if (isPanning) {
-      view.x = e.clientX - panStart.x;
+      view.x = (flippedH ? -e.clientX : e.clientX) - panStart.x;
       view.y = e.clientY - panStart.y;
       renderView(); // fast: no filter recomputation
     } else if (drawState) {
@@ -844,8 +857,9 @@ for (let i = 0; i < PANEL_COUNT; i++) {
     if (!srcImage) return;
     e.preventDefault();
     const rect = panel.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
+    let mx = e.clientX - rect.left;
     const my = e.clientY - rect.top;
+    if (flippedH) mx = rect.width - mx;
 
     const factor = e.deltaY < 0 ? 1.1 : 1/1.1;
     const newScale = view.scale * factor;
