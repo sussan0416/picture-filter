@@ -89,6 +89,7 @@
     <button id="btnZoom" data-tool="zoom">Zoom</button>
     <button id="btnLine" data-tool="line">Line</button>
     <button id="btnFree" data-tool="free">Freehand</button>
+    <button id="btnErase" data-tool="erase">Erase</button>
   </div>
   <div class="sep"></div>
   <div class="tool-group">
@@ -106,6 +107,7 @@
   <div class="sep"></div>
   <button id="btnUndo">Undo</button>
   <button id="btnClearAnnot">Clear Annotations</button>
+  <button id="btnToggleAnnot">Hide Annot.</button>
   <div class="sep"></div>
   <button id="btnFlipH">Flip H</button>
   <button id="btnResetView">Fit Image</button>
@@ -226,6 +228,8 @@ const panelBC = [
 ];
 
 let soloPanel = null; // null = grid view, 0-5 = solo panel index
+let annotationsVisible = true;
+let isErasing = false;
 
 const panels = [];
 const canvases = [];
@@ -492,7 +496,9 @@ function drawPanel(idx) {
   }
 
   // Draw annotations (in image coordinate space)
-  for (const a of annotations) drawAnnotation(ctx, a);
+  if (annotationsVisible) {
+    for (const a of annotations) drawAnnotation(ctx, a);
+  }
   if (drawState) drawAnnotation(ctx, drawState);
 
   ctx.restore();
@@ -512,6 +518,34 @@ function drawAnnotation(ctx, a) {
     for (let i = 1; i < a.points.length; i++) ctx.lineTo(a.points[i][0], a.points[i][1]);
   }
   ctx.stroke();
+}
+
+// ---- Erase ----
+function pointToSegmentDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const lenSq = dx*dx + dy*dy;
+  if (lenSq === 0) return Math.hypot(px - ax, py - ay);
+  const t = Math.max(0, Math.min(1, ((px-ax)*dx + (py-ay)*dy) / lenSq));
+  return Math.hypot(px - (ax + t*dx), py - (ay + t*dy));
+}
+
+function eraseAnnotationAt(ix, iy) {
+  const extraTol = 8 / view.scale; // 8 screen-pixel buffer in image coords
+  let minDist = Infinity, minIdx = -1;
+  for (let ai = 0; ai < annotations.length; ai++) {
+    const a = annotations[ai];
+    const hitTol = a.width / 2 / view.scale + extraTol;
+    const pts = a.points;
+    let dist = pts.length === 1
+      ? Math.hypot(ix - pts[0][0], iy - pts[0][1])
+      : Infinity;
+    for (let pi = 0; pi < pts.length - 1; pi++) {
+      dist = Math.min(dist, pointToSegmentDist(ix, iy, pts[pi][0], pts[pi][1], pts[pi+1][0], pts[pi+1][1]));
+    }
+    if (dist < hitTol && dist < minDist) { minDist = dist; minIdx = ai; }
+  }
+  if (minIdx >= 0) { annotations.splice(minIdx, 1); return true; }
+  return false;
 }
 
 // ---- Brightness / Contrast ----
@@ -1054,8 +1088,9 @@ function updateGridCursor() {
   switch (tool) {
     case 'pan':  grid.style.cursor = isPanning ? 'grabbing' : 'grab'; break;
     case 'zoom': grid.style.cursor = altHeld ? CURSOR_ZOOM_OUT : CURSOR_ZOOM_IN; break;
-    case 'line': grid.style.cursor = 'crosshair'; break;
-    case 'free': grid.style.cursor = 'crosshair'; break;
+    case 'line':  grid.style.cursor = 'crosshair'; break;
+    case 'free':  grid.style.cursor = 'crosshair'; break;
+    case 'erase': grid.style.cursor = 'cell'; break;
     default:     grid.style.cursor = 'default';
   }
 }
@@ -1107,6 +1142,13 @@ document.getElementById('btnClearAnnot').addEventListener('click', () => {
   annotations = [];
   renderAll();
 });
+document.getElementById('btnToggleAnnot').addEventListener('click', () => {
+  annotationsVisible = !annotationsVisible;
+  const btn = document.getElementById('btnToggleAnnot');
+  btn.textContent = annotationsVisible ? 'Hide Annot.' : 'Show Annot.';
+  btn.classList.toggle('active', !annotationsVisible);
+  renderView();
+});
 
 // ---- Pan / Zoom / Draw (synced across panels) ----
 let isPanning = false;
@@ -1154,6 +1196,10 @@ for (let i = 0; i < PANEL_COUNT; i++) {
       const zoomIn = !e.altKey;
       applyZoom(e.clientX, e.clientY, panel, zoomIn);
       isZooming = true;
+    } else if (tool === 'erase') {
+      isErasing = true;
+      const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
+      if (eraseAnnotationAt(ix, iy)) renderView();
     } else {
       const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
       const color = document.getElementById('annotColor').value;
@@ -1168,6 +1214,9 @@ for (let i = 0; i < PANEL_COUNT; i++) {
       view.x = (flippedH ? -e.clientX : e.clientX) - panStart.x;
       view.y = e.clientY - panStart.y;
       renderView(); // fast: no filter recomputation
+    } else if (isErasing) {
+      const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
+      if (eraseAnnotationAt(ix, iy)) renderView();
     } else if (drawState) {
       const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
       if (drawState.type === 'line') {
@@ -1185,6 +1234,8 @@ for (let i = 0; i < PANEL_COUNT; i++) {
       updateGridCursor();
     } else if (isZooming) {
       isZooming = false;
+    } else if (isErasing) {
+      isErasing = false;
     } else if (drawState) {
       const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
       if (drawState.type === 'line') {
