@@ -91,6 +91,7 @@
     <button id="btnZoom" data-tool="zoom">Zoom</button>
     <button id="btnLine" data-tool="line">Line</button>
     <button id="btnFree" data-tool="free">Freehand</button>
+    <button id="btnOval" data-tool="oval">Oval</button>
     <button id="btnErase" data-tool="erase">Erase</button>
   </div>
   <div class="sep"></div>
@@ -513,11 +514,21 @@ function drawAnnotation(ctx, a) {
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   ctx.beginPath();
-  ctx.moveTo(a.points[0][0], a.points[0][1]);
-  if (a.type === 'line' && a.points.length === 2) {
-    ctx.lineTo(a.points[1][0], a.points[1][1]);
+  if (a.type === 'oval') {
+    if (a.points.length < 2) return;
+    const cx = (a.points[0][0] + a.points[1][0]) / 2;
+    const cy = (a.points[0][1] + a.points[1][1]) / 2;
+    const rx = Math.abs(a.points[1][0] - a.points[0][0]) / 2;
+    const ry = Math.abs(a.points[1][1] - a.points[0][1]) / 2;
+    if (rx === 0 || ry === 0) return;
+    ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
   } else {
-    for (let i = 1; i < a.points.length; i++) ctx.lineTo(a.points[i][0], a.points[i][1]);
+    ctx.moveTo(a.points[0][0], a.points[0][1]);
+    if (a.type === 'line' && a.points.length === 2) {
+      ctx.lineTo(a.points[1][0], a.points[1][1]);
+    } else {
+      for (let i = 1; i < a.points.length; i++) ctx.lineTo(a.points[i][0], a.points[i][1]);
+    }
   }
   ctx.stroke();
 }
@@ -538,11 +549,23 @@ function eraseAnnotationAt(ix, iy) {
     const a = annotations[ai];
     const hitTol = a.width / 2 / view.scale + extraTol;
     const pts = a.points;
-    let dist = pts.length === 1
-      ? Math.hypot(ix - pts[0][0], iy - pts[0][1])
-      : Infinity;
-    for (let pi = 0; pi < pts.length - 1; pi++) {
-      dist = Math.min(dist, pointToSegmentDist(ix, iy, pts[pi][0], pts[pi][1], pts[pi+1][0], pts[pi+1][1]));
+    let dist;
+    if (a.type === 'oval' && pts.length >= 2) {
+      const cx = (pts[0][0] + pts[1][0]) / 2, cy = (pts[0][1] + pts[1][1]) / 2;
+      const rx = Math.abs(pts[1][0] - pts[0][0]) / 2, ry = Math.abs(pts[1][1] - pts[0][1]) / 2;
+      if (rx > 0 && ry > 0) {
+        const theta = Math.atan2((iy - cy) / ry, (ix - cx) / rx);
+        dist = Math.hypot(ix - (cx + rx * Math.cos(theta)), iy - (cy + ry * Math.sin(theta)));
+      } else {
+        dist = Math.hypot(ix - cx, iy - cy);
+      }
+    } else {
+      dist = pts.length === 1
+        ? Math.hypot(ix - pts[0][0], iy - pts[0][1])
+        : Infinity;
+      for (let pi = 0; pi < pts.length - 1; pi++) {
+        dist = Math.min(dist, pointToSegmentDist(ix, iy, pts[pi][0], pts[pi][1], pts[pi+1][0], pts[pi+1][1]));
+      }
     }
     if (dist < hitTol && dist < minDist) { minDist = dist; minIdx = ai; }
   }
@@ -1094,6 +1117,7 @@ function updateGridCursor() {
     case 'zoom': grid.style.cursor = altHeld ? CURSOR_ZOOM_OUT : CURSOR_ZOOM_IN; break;
     case 'line':  grid.style.cursor = 'crosshair'; break;
     case 'free':  grid.style.cursor = 'crosshair'; break;
+    case 'oval':  grid.style.cursor = 'crosshair'; break;
     case 'erase': grid.style.cursor = 'cell'; break;
     default:     grid.style.cursor = 'default';
   }
@@ -1222,7 +1246,7 @@ for (let i = 0; i < PANEL_COUNT; i++) {
       const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
       const color = document.getElementById('annotColor').value;
       const width = parseInt(document.getElementById('annotWidth').value);
-      drawState = { type: tool === 'line' ? 'line' : 'free', points: [[ix, iy]], color, width };
+      drawState = { type: tool === 'line' ? 'line' : tool === 'oval' ? 'oval' : 'free', points: [[ix, iy]], color, width };
     }
   });
 
@@ -1264,7 +1288,7 @@ for (let i = 0; i < PANEL_COUNT; i++) {
       if (eraseAnnotationAt(ix, iy)) renderView();
     } else if (drawState) {
       const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
-      if (drawState.type === 'line') {
+      if (drawState.type === 'line' || drawState.type === 'oval') {
         drawState.points[1] = [ix, iy];
       } else {
         drawState.points.push([ix, iy]);
@@ -1287,7 +1311,7 @@ for (let i = 0; i < PANEL_COUNT; i++) {
       isErasing = false;
     } else if (drawState) {
       const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
-      if (drawState.type === 'line') {
+      if (drawState.type === 'line' || drawState.type === 'oval') {
         drawState.points[1] = [ix, iy];
       } else {
         drawState.points.push([ix, iy]);
