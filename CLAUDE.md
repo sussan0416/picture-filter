@@ -6,12 +6,14 @@
 ## パネル構成（6分割）
 | idx | タイトル | パラメータ |
 |-----|---------|-----------|
-| 0 | Original | なし |
-| 1 | Grayscale | なし |
+| 0 | Original | Brightness スライダー / Contrast スライダー |
+| 1 | Grayscale | Brightness スライダー / Contrast スライダー |
 | 2 | Binary | Threshold スライダー |
 | 3 | Edge (Sobel) | Threshold スライダー |
 | 4 | Blur | Type セレクト + Radius スライダー |
 | 5 | Reduce Color | Colors スライダー（k-means） |
+
+各パネルヘッダー右端に **↺（パラメータリセット）** と **⛶（単体表示）** ボタンがある。
 
 ## OpenCV.js
 - ローカルに `opencv.js` を置いて使う（gitignore済み）
@@ -45,10 +47,34 @@
 - 結果を `workingCanvas`（RGBA）と `workingGray`（Uint8Array）にキャッシュ
 - グレースケールは Grayscale / Binary / Edge フィルタの JS fallback が共用
 
+### Brightness / Contrast（`applyBCToCanvas`）
+- panel 0（Original）と panel 1（Grayscale）に適用
+- `panelBC[0/1] = { brightness: -100〜100, contrast: -100〜100 }`
+- OpenCV: `Mat.convertTo(dst, -1, alpha, beta)`（alpha = 1 + contrast/100、beta = brightness）
+- JS fallback: ピクセルループで `clamp(alpha * v + beta, 0, 255)`
+- B/C が両方 0 の場合は srcCanvas をそのまま返してコピーをスキップ
+- `getFilterKey(0/1)` に B/C 値を含めてキャッシュを管理
+- panel 0 は以前 `ensureFilter` で早期 return していたが、B/C 対応のため通常フィルタと同じパスで処理
+
 ### レンダリング分離
 - `renderAll()` — フィルタ再計算 + 描画（スライダー変更・ズームレベル変化時）
 - `renderView()` — キャッシュ済みフィルタから再描画のみ（パン・アノテーション描画中）
 - フィルタキャッシュは `filterResults[6]` に保持、パラメータ変更時に `invalidateFilter(idx)` で個別無効化
+
+### 単体表示（Solo view）
+- `soloPanel`（null or 0〜5）で状態管理
+- `enterSolo(idx)` / `exitSolo()` で切り替え
+- CSS: `#grid.solo .panel:not(.solo-active) { display: none }` + `grid-column: 1/4; grid-row: 1/3` でフル展開
+- 切り替え時に `resizeCanvases()` を呼んでキャンバスサイズを再計算
+
+### Fit Image（旧 Reset View）
+- `resetView()` は常に表示中のパネルサイズを基準にする
+- ソロモード中: `panels[soloPanel]` のサイズを使用（panel 0 が非表示で getBoundingClientRect() = 0×0 になるため）
+- グリッド表示中: `panels[0]` のサイズを使用
+
+### パラメータリセット
+- `PANEL_DEFAULTS[idx]()` が各パネルのデフォルト値に戻す関数
+- デフォルト値: Brightness/Contrast=0、Binary threshold=128、Edge threshold=30、Blur type=gaussian/radius=3、Colors=8
 
 ### 座標系
 - アノテーションは画像座標系で保存（ズーム・パンに追従）
