@@ -514,62 +514,59 @@ function drawMeasureAnnotation(ctx, a) {
   const [ax, ay] = a.points[0];
   const [bx, by] = a.points[1];
   const refLen = Math.hypot(bx - ax, by - ay);
-  // Phase 2 has a 3rd point (extEnd); phase 1 preview ends at refEnd
-  const [cx, cy] = a.points.length >= 3 ? a.points[2] : a.points[1];
-
-  // Draw main line
-  ctx.beginPath();
-  ctx.moveTo(ax, ay);
-  ctx.lineTo(cx, cy);
-  ctx.stroke();
-
   if (refLen < 0.5) return;
+
   const tickHalf = 10 / view.scale; // 20px total in screen space
+  const drawTick = (tx, ty, perpX, perpY) => {
+    ctx.beginPath();
+    ctx.moveTo(tx - perpX * tickHalf, ty - perpY * tickHalf);
+    ctx.lineTo(tx + perpX * tickHalf, ty + perpY * tickHalf);
+    ctx.stroke();
+  };
 
   if (a.points.length < 3) {
-    // Phase 1 preview: ticks at refStart and refEnd, perpendicular to AB
+    // Phase 1 preview: reference line with endpoint ticks perpendicular to AB
     const ux = (bx - ax) / refLen, uy = (by - ay) / refLen;
     const perpX = -uy, perpY = ux;
-    for (const [px, py] of [[ax, ay], [bx, by]]) {
-      ctx.beginPath();
-      ctx.moveTo(px - perpX * tickHalf, py - perpY * tickHalf);
-      ctx.lineTo(px + perpX * tickHalf, py + perpY * tickHalf);
-      ctx.stroke();
-    }
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+    drawTick(ax, ay, perpX, perpY);
+    drawTick(bx, by, perpX, perpY);
     return;
   }
 
-  // Phase 2: ticks perpendicular to the main line (AC)
+  // Phase 2: extended line with ticks perpendicular to AC
+  const [cx, cy] = a.points[2];
   const dx = cx - ax, dy = cy - ay;
   const totalLen = Math.hypot(dx, dy);
   if (totalLen < 0.5) return;
   const ux = dx / totalLen, uy = dy / totalLen;
   const perpX = -uy, perpY = ux;
+  const numTicks = Math.floor(totalLen / refLen);
 
-  // Tick at refStart (A)
+  // Main line: extend backward if bidirectional
+  const startX = a.bidirectional ? ax - dx : ax;
+  const startY = a.bidirectional ? ay - dy : ay;
   ctx.beginPath();
-  ctx.moveTo(ax - perpX * tickHalf, ay - perpY * tickHalf);
-  ctx.lineTo(ax + perpX * tickHalf, ay + perpY * tickHalf);
+  ctx.moveTo(startX, startY);
+  ctx.lineTo(cx, cy);
   ctx.stroke();
 
-  // Tick at actual refEnd (B), plus extension ticks at every refLen interval
-  const numTicks = Math.floor(totalLen / refLen);
+  // Forward ticks: A (n=0), intervals n=1..numTicks, plus actual B if off-grid
+  drawTick(ax, ay, perpX, perpY);
   for (let n = 1; n <= numTicks; n++) {
-    const t = n * refLen;
-    const tx = ax + ux * t;
-    const ty = ay + uy * t;
-    ctx.beginPath();
-    ctx.moveTo(tx - perpX * tickHalf, ty - perpY * tickHalf);
-    ctx.lineTo(tx + perpX * tickHalf, ty + perpY * tickHalf);
-    ctx.stroke();
+    drawTick(ax + ux * n * refLen, ay + uy * n * refLen, perpX, perpY);
   }
-  // Tick at actual B (refEnd) if it doesn't coincide with an interval tick
-  const tB = (bx - ax) * ux + (by - ay) * uy; // projection of B onto AC
+  const tB = (bx - ax) * ux + (by - ay) * uy;
   if (Math.abs(tB % refLen) > 0.5 && tB > 0.5 && tB < totalLen - 0.5) {
-    ctx.beginPath();
-    ctx.moveTo(bx - perpX * tickHalf, by - perpY * tickHalf);
-    ctx.lineTo(bx + perpX * tickHalf, by + perpY * tickHalf);
-    ctx.stroke();
+    drawTick(bx, by, perpX, perpY);
+  }
+
+  // Backward ticks if bidirectional: symmetric intervals + backward endpoint
+  if (a.bidirectional) {
+    for (let n = 1; n <= numTicks; n++) {
+      drawTick(ax - ux * n * refLen, ay - uy * n * refLen, perpX, perpY);
+    }
+    drawTick(startX, startY, perpX, perpY);
   }
 }
 
@@ -586,10 +583,17 @@ function drawAnnotation(ctx, a) {
   ctx.beginPath();
   if (a.type === 'oval') {
     if (a.points.length < 2) return;
-    const cx = (a.points[0][0] + a.points[1][0]) / 2;
-    const cy = (a.points[0][1] + a.points[1][1]) / 2;
-    const rx = Math.abs(a.points[1][0] - a.points[0][0]) / 2;
-    const ry = Math.abs(a.points[1][1] - a.points[0][1]) / 2;
+    let cx, cy, rx, ry;
+    if (a.fromCenter) {
+      cx = a.points[0][0]; cy = a.points[0][1];
+      rx = Math.abs(a.points[1][0] - a.points[0][0]);
+      ry = Math.abs(a.points[1][1] - a.points[0][1]);
+    } else {
+      cx = (a.points[0][0] + a.points[1][0]) / 2;
+      cy = (a.points[0][1] + a.points[1][1]) / 2;
+      rx = Math.abs(a.points[1][0] - a.points[0][0]) / 2;
+      ry = Math.abs(a.points[1][1] - a.points[0][1]) / 2;
+    }
     if (rx === 0 || ry === 0) return;
     ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
   } else {
@@ -621,16 +625,25 @@ function eraseAnnotationAt(ix, iy) {
     const pts = a.points;
     let dist;
     if (a.type === 'measure' && pts.length >= 3) {
-      // Main line runs from pts[0] (refStart) to pts[2] (extEnd)
-      dist = pointToSegmentDist(ix, iy, pts[0][0], pts[0][1], pts[2][0], pts[2][1]);
+      // Bidirectional: line spans from mirror of extEnd through refStart to extEnd
+      const [ax, ay] = pts[0], [cx, cy] = pts[2];
+      const startX = a.bidirectional ? 2 * ax - cx : ax;
+      const startY = a.bidirectional ? 2 * ay - cy : ay;
+      dist = pointToSegmentDist(ix, iy, startX, startY, cx, cy);
     } else if (a.type === 'oval' && pts.length >= 2) {
-      const cx = (pts[0][0] + pts[1][0]) / 2, cy = (pts[0][1] + pts[1][1]) / 2;
-      const rx = Math.abs(pts[1][0] - pts[0][0]) / 2, ry = Math.abs(pts[1][1] - pts[0][1]) / 2;
-      if (rx > 0 && ry > 0) {
-        const theta = Math.atan2((iy - cy) / ry, (ix - cx) / rx);
-        dist = Math.hypot(ix - (cx + rx * Math.cos(theta)), iy - (cy + ry * Math.sin(theta)));
+      let ecx, ecy, erx, ery;
+      if (a.fromCenter) {
+        ecx = pts[0][0]; ecy = pts[0][1];
+        erx = Math.abs(pts[1][0] - pts[0][0]); ery = Math.abs(pts[1][1] - pts[0][1]);
       } else {
-        dist = Math.hypot(ix - cx, iy - cy);
+        ecx = (pts[0][0] + pts[1][0]) / 2; ecy = (pts[0][1] + pts[1][1]) / 2;
+        erx = Math.abs(pts[1][0] - pts[0][0]) / 2; ery = Math.abs(pts[1][1] - pts[0][1]) / 2;
+      }
+      if (erx > 0 && ery > 0) {
+        const theta = Math.atan2((iy - ecy) / ery, (ix - ecx) / erx);
+        dist = Math.hypot(ix - (ecx + erx * Math.cos(theta)), iy - (ecy + ery * Math.sin(theta)));
+      } else {
+        dist = Math.hypot(ix - ecx, iy - ecy);
       }
     } else {
       dist = pts.length === 1
@@ -1342,7 +1355,11 @@ for (let i = 0; i < PANEL_COUNT; i++) {
       const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
       const color = document.getElementById('annotColor').value;
       const width = parseInt(document.getElementById('annotWidth').value);
-      drawState = { type: tool === 'line' ? 'line' : tool === 'oval' ? 'oval' : 'free', points: [[ix, iy]], color, width };
+      if (tool === 'oval') {
+        drawState = { type: 'oval', points: [[ix, iy]], color, width, fromCenter: altHeld };
+      } else {
+        drawState = { type: tool === 'line' ? 'line' : 'free', points: [[ix, iy]], color, width };
+      }
     }
   });
 
@@ -1390,6 +1407,7 @@ for (let i = 0; i < PANEL_COUNT; i++) {
         points: [measureState.refStart, measureState.refEnd, [ix, iy]],
         color: measureState.color,
         width: measureState.width,
+        bidirectional: altHeld,
       };
       renderView();
     } else if (drawState) {
@@ -1423,6 +1441,7 @@ for (let i = 0; i < PANEL_COUNT; i++) {
         points: [measureState.refStart, measureState.refEnd, [ix, iy]],
         color: measureState.color,
         width: measureState.width,
+        bidirectional: altHeld,
       });
       measureState = null;
       drawState = null;

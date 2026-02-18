@@ -127,7 +127,17 @@
 - 始点（refStart）と終点（refEnd）にも直交線を描画
   - Phase 1 プレビュー: AB 方向に対して垂直
   - Phase 2: AC 方向（メインライン方向）に対して垂直。refEnd が interval と重ならない場合は実際の B 位置にも追加描画
-- Erase ヒット判定: `points[0]` → `points[2]` の線分に対して距離計算
+- **bidirectional モード**: Phase 2 確定時に Option/Alt を押しながら pointerup → 始点から逆方向にも同じ長さで線・ティックを延長
+  - `bidirectional: true` フラグをアノテーションに保存
+  - Phase 2 pointermove でも `altHeld` によりリアルタイムプレビュー更新
+  - Erase ヒット判定: bidirectional 時は逆端（`2*ax - cx`）→ extEnd の線分
+- Erase ヒット判定: `points[0]` → `points[2]` の線分に対して距離計算（非 bidirectional）
+
+### Oval ツール — fromCenter モード
+- Option/Alt キーを押しながら pointerdown を開始すると、ドラッグ始点が楕円の**中心**になる
+- `fromCenter: true` フラグをアノテーションに保存
+- 描画: `cx/cy = points[0]`, `rx = |points[1].x - points[0].x|`, `ry = |points[1].y - points[0].y|`（通常モードの 2 倍の半径）
+- Erase ヒット判定も fromCenter フラグを考慮
 
 ## デプロイ
 - GitHub Pages、Source は **GitHub Actions** に設定
