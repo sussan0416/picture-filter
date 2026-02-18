@@ -1,0 +1,45 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download OpenCV.js
+        run: |
+          # Fetch latest release tag from OpenCV
+          LATEST=$(curl -s https://api.github.com/repos/opencv/opencv/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Latest OpenCV release: $LATEST"
+
+          # Download docs zip
+          curl -L -o opencv-docs.zip "https://github.com/opencv/opencv/releases/download/${LATEST}/opencv-${LATEST}-docs.zip"
+
+          # Extract only opencv.js and clean up
+          unzip -j opencv-docs.zip "*/js/bin/opencv.js" -d .
+          rm opencv-docs.zip
+          ls -lh opencv.js
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+      - id: deployment
+        uses: actions/deploy-pages@v4
