@@ -65,7 +65,7 @@
 - `soloPanel`（null or 0〜5）で状態管理
 - `enterSolo(idx)` / `exitSolo()` で切り替え
 - CSS: `#grid.solo .panel:not(.solo-active) { display: none }` + `grid-column: 1/4; grid-row: 1/3` でフル展開
-- 切り替え時に `resizeCanvases()` を呼んでキャンバスサイズを再計算
+- 切り替え時に `resizeCanvases()` → `resetView()` → `renderAll()` の順で呼び出し、キャンバスリサイズ後に自動 Fit Image
 
 ### Fit Image（旧 Reset View）
 - `resetView()` は常に表示中のパネルサイズを基準にする
@@ -80,10 +80,23 @@
 - アノテーションは画像座標系で保存（ズーム・パンに追従）
 - 左右反転（Flip H）時は `screenToImage`、`applyZoom`、ホイールズーム、パンの全箇所でX座標を補正済み
 
+### アノテーション管理
+- `annotations`: 確定済みストロークの配列 `{type:'line'|'free', points:[[x,y],...], color, width}`
+- `drawState`: 描画中ストローク（確定前）。`annotationsVisible` が false でも常に表示
+- **Hide Annot. ボタン**: `annotationsVisible` フラグをトグル。`renderView()` のみ呼ぶのでフィルタ再計算なし
+
+### 消しゴム（Erase ツール）
+- ストローク単位で削除。クリックまたはドラッグで最近傍ストロークを消去
+- `eraseAnnotationAt(ix, iy)`: 画像座標でヒット判定し、最近傍ストロークを `annotations.splice` で削除
+- `pointToSegmentDist`: 点と線分の最短距離（パラメトリック投影）
+- ヒット許容範囲: `ストロークの width / 2 / view.scale + 8 / view.scale`（8スクリーンピクセルのバッファ）
+- `isErasing` フラグで drag-erase（移動中も連続削除）を実現
+
 ## ツール
-- Pan / Zoom / Line / Freehand
+- Pan / Zoom / Line / Freehand / Erase
 - Zoom: 通常クリック=拡大、Alt/Option+クリック=縮小、Space長押し=一時Pan
 - Flip H: 全パネル同期で左右反転トグル
+- Hide Annot.: アノテーションの表示/非表示トグル（ストロークは保持）
 
 ## デプロイ
 - GitHub Pages、Source は **GitHub Actions** に設定
