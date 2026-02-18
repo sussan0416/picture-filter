@@ -78,12 +78,12 @@
 
 ### 座標系
 - アノテーションは画像座標系で保存（ズーム・パンに追従）
-- 左右反転（Flip H）時は `screenToImage`、`applyZoom`、ホイールズーム、パンの全箇所でX座標を補正済み
+- 左右反転（Mirror）時は `screenToImage`、`applyZoom`、ホイールズーム、パンの全箇所でX座標を補正済み
 
 ### アノテーション管理
-- `annotations`: 確定済みストロークの配列 `{type:'line'|'free', points:[[x,y],...], color, width}`
+- `annotations`: 確定済みストロークの配列 `{type:'line'|'free'|'oval', points:[[x,y],...], color, width}`
 - `drawState`: 描画中ストローク（確定前）。`annotationsVisible` が false でも常に表示
-- **Hide Annot. ボタン**: `annotationsVisible` フラグをトグル。`renderView()` のみ呼ぶのでフィルタ再計算なし
+- **Hide/Show ボタン**: `annotationsVisible` フラグをトグル。`renderView()` のみ呼ぶのでフィルタ再計算なし。ボタン幅は `min-width: 4.5em` で固定
 
 ### 消しゴム（Erase ツール）
 - ストローク単位で削除。クリックまたはドラッグで最近傍ストロークを消去
@@ -91,12 +91,29 @@
 - `pointToSegmentDist`: 点と線分の最短距離（パラメトリック投影）
 - ヒット許容範囲: `ストロークの width / 2 / view.scale + 8 / view.scale`（8スクリーンピクセルのバッファ）
 - `isErasing` フラグで drag-erase（移動中も連続削除）を実現
+- Oval のヒット判定: `atan2` で楕円輪郭上の最近傍点を求めて距離を計算
+
+### Oval ツール
+- ドラッグの始点・終点をバウンディングボックスの対角コーナーとして楕円を描画
+- `points[0]`（ドラッグ開始）と `points[1]`（ドラッグ終了）の2点で管理（Line と同じ2点モデル）
+- `drawAnnotation` 内で `cx/cy/rx/ry` を算出し `ctx.ellipse()` で描画
+- rx または ry が 0 の場合（タップのみ）は描画スキップ
+
+### タッチ操作（ピンチズーム）
+- `.panel canvas` に `touch-action: none` を設定してブラウザデフォルトのピンチ拡大を無効化
+- 各キャンバスのイベントループ内に `ptrMap`（`Map<pointerId, {x,y}>`）を保持してアクティブポインターを追跡
+- `pointerdown` 時に `ptrMap.size >= 2` を検出したらパン/描画/消しゴムをキャンセルしてピンチモードへ移行
+- `pointermove` 時に2点間距離の変化率でスケール計算、2本指の中点を基準にズーム
+- `pointercancel` ハンドラーで電話着信などの割り込み時に状態をリセット
+- ピンチ終了後（指を全て離した後）に単指操作を再開するには新たな `pointerdown` が必要
 
 ## ツール
-- Pan / Zoom / Line / Freehand / Erase
+- Pan / Zoom / Line / Freehand / Oval / Erase
 - Zoom: 通常クリック=拡大、Alt/Option+クリック=縮小、Space長押し=一時Pan
-- Flip H: 全パネル同期で左右反転トグル
-- Hide Annot.: アノテーションの表示/非表示トグル（ストロークは保持）
+- タッチ: 2本指ピンチで拡大縮小
+- Mirror: 全パネル同期で左右反転トグル
+- Hide/Show: アノテーションの表示/非表示トグル（ストロークは保持）
+- Clear: 全アノテーション削除
 
 ## デプロイ
 - GitHub Pages、Source は **GitHub Actions** に設定
