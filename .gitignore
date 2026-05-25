@@ -1,1 +1,7 @@
 opencv.js
+.DS_Store
+node_modules/
+www/
+android/.gradle/
+android/app/build/
+android/build/
