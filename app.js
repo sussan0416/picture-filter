@@ -1,0 +1,1385 @@
+// ---- OpenCV.js loading ----
+let cvReady = false;
+(function loadOpenCV() {
+  const script = document.createElement('script');
+  script.async = true;
+  script.src = 'opencv.js';
+  script.onload = () => {
+    if (typeof cv !== 'undefined') {
+      if (cv.Mat) {
+        onCvReady();
+      } else {
+        cv['onRuntimeInitialized'] = onCvReady;
+      }
+    }
+  };
+  script.onerror = () => {
+    const el = document.getElementById('cv-status');
+    el.textContent = 'OpenCV.js failed to load (blur uses JS fallback)';
+    el.className = 'error';
+  };
+  document.head.appendChild(script);
+})();
+function onCvReady() {
+  cvReady = true;
+  const el = document.getElementById('cv-status');
+  el.textContent = 'OpenCV.js ready';
+  el.className = 'ready';
+  setTimeout(() => el.style.display = 'none', 2000);
+  workingMip = -1; // force working data recompute using CV
+  invalidateAllFilters();
+  if (srcImage) scheduleRender();
+}
+
+// ---- State ----
+let srcImage = null;
+const view = { x: 0, y: 0, scale: 1 };
+let annotations = []; // {type:'line'|'free'|'oval'|'measure', points:[[x,y],...], color, width}
+let currentTool = 'pan';
+let drawState = null; // in-progress annotation
+let flippedH = false;
+
+// Brightness/contrast per panel (panels 0 and 1 only)
+const panelBC = [
+  { brightness: 0, contrast: 0 }, // panel 0: Original
+  { brightness: 0, contrast: 0 }, // panel 1: Grayscale
+];
+
+let soloPanel = null; // null = grid view, 0-5 = solo panel index
+let soloTransitioning = false;
+const SOLO_FADE_MS = 200;
+let annotationsVisible = true;
+let isErasing = false;
+let measureState = null; // {refStart, refEnd, color, width} — between phase 1 and phase 2
+
+const panels = [];
+const canvases = [];
+const PANEL_COUNT = 6;
+
+// ---- Working resolution system ----
+// Filters run at a resolution matched to the current zoom level, not full image size.
+let workingCanvas = null; // source image downsampled to current mip level
+let workingGray = null;   // grayscale Uint8Array at working resolution
+let workingMip = -1;      // current mip level (1 = full res, 0.5 = half, etc.)
+
+// Per-panel filter cache (persists across frames, invalidated explicitly)
+const filterResults = new Array(PANEL_COUNT).fill(null);
+const filterCacheKeys = new Array(PANEL_COUNT).fill('');
+
+// ---- Init ----
+for (let i = 0; i < PANEL_COUNT; i++) {
+  const panel = document.getElementById('p' + i);
+  const canvas = panel.querySelector('canvas');
+  panels.push(panel);
+  canvases.push(canvas);
+}
+
+// Default parameter values per panel
+const PANEL_DEFAULTS = [
+  () => { // panel 0: Original
+    document.getElementById('p0Bright').value = 0;
+    document.getElementById('p0BrightVal').textContent = '0';
+    document.getElementById('p0Contrast').value = 0;
+    document.getElementById('p0ContrastVal').textContent = '0';
+    panelBC[0].brightness = 0; panelBC[0].contrast = 0;
+    invalidateFilter(0);
+  },
+  () => { // panel 1: Grayscale
+    document.getElementById('p1Bright').value = 0;
+    document.getElementById('p1BrightVal').textContent = '0';
+    document.getElementById('p1Contrast').value = 0;
+    document.getElementById('p1ContrastVal').textContent = '0';
+    panelBC[1].brightness = 0; panelBC[1].contrast = 0;
+    invalidateFilter(1);
+  },
+  () => { // panel 2: Binary
+    document.getElementById('binThresh').value = 128;
+    document.getElementById('binVal').textContent = '128';
+    invalidateFilter(2);
+  },
+  () => { // panel 3: Edge
+    document.getElementById('edgeThresh').value = 30;
+    document.getElementById('edgeVal').textContent = '30';
+    invalidateFilter(3);
+  },
+  () => { // panel 4: Blur
+    document.getElementById('blurType').value = 'gaussian';
+    document.getElementById('blurRadius').value = 3;
+    document.getElementById('blurRadiusVal').textContent = '3';
+    invalidateFilter(4);
+  },
+  () => { // panel 5: Reduce Color
+    document.getElementById('reduceColors').value = 8;
+    document.getElementById('reduceColorsVal').textContent = '8';
+    invalidateFilter(5);
+  },
+];
+
+// Add reset + expand buttons to each panel header
+for (let i = 0; i < PANEL_COUNT; i++) {
+  const header = panels[i].querySelector('.panel-header');
+  const actions = document.createElement('div');
+  actions.className = 'panel-actions';
+
+  const resetBtn = document.createElement('button');
+  resetBtn.className = 'btn-reset';
+  resetBtn.textContent = '↺';
+  resetBtn.title = 'パラメータをリセット';
+  resetBtn.addEventListener('click', () => { PANEL_DEFAULTS[i](); scheduleRender(); });
+
+  const expandBtn = document.createElement('button');
+  expandBtn.className = 'btn-expand';
+  expandBtn.textContent = '⛶';
+  expandBtn.title = '単体表示';
+  expandBtn.addEventListener('click', () => {
+    if (soloPanel === i) exitSolo();
+    else enterSolo(i);
+  });
+
+  actions.appendChild(resetBtn);
+  actions.appendChild(expandBtn);
+  header.appendChild(actions);
+}
+
+function resizeCanvases() {
+  for (let i = 0; i < PANEL_COUNT; i++) {
+    const rect = panels[i].getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvases[i].width = rect.width * dpr;
+    canvases[i].height = rect.height * dpr;
+    canvases[i].style.width = rect.width + 'px';
+    canvases[i].style.height = rect.height + 'px';
+  }
+  renderAll();
+}
+window.addEventListener('resize', resizeCanvases);
+
+// ---- File loading ----
+document.getElementById('fileInput').addEventListener('change', e => {
+  if (e.target.files[0]) loadFile(e.target.files[0]);
+});
+
+// Drag & drop
+document.addEventListener('dragover', e => { e.preventDefault(); document.getElementById('drop-overlay').classList.add('visible'); });
+document.addEventListener('dragleave', e => { if (e.relatedTarget === null) document.getElementById('drop-overlay').classList.remove('visible'); });
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  document.getElementById('drop-overlay').classList.remove('visible');
+  if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+});
+
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = ev => {
+    const img = new Image();
+    img.onload = () => {
+      srcImage = img;
+      workingMip = -1; // force recompute
+      invalidateAllFilters();
+      resetView();
+      renderAll();
+    };
+    img.src = ev.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+function resetView() {
+  if (!srcImage) return;
+  const activeIdx = soloPanel !== null ? soloPanel : 0;
+  const rect = panels[activeIdx].getBoundingClientRect();
+  const sx = rect.width / srcImage.width;
+  const sy = rect.height / srcImage.height;
+  view.scale = Math.min(sx, sy) * 0.9;
+  view.x = (rect.width - srcImage.width * view.scale) / 2;
+  view.y = (rect.height - srcImage.height * view.scale) / 2;
+}
+
+// ---- Working resolution management ----
+function computeMipLevel() {
+  const dpr = window.devicePixelRatio || 1;
+  const eff = view.scale * dpr;
+  // Discrete levels to avoid constant recomputation
+  if (eff >= 0.5)   return 1;
+  if (eff >= 0.25)  return 0.5;
+  if (eff >= 0.125) return 0.25;
+  return 0.125;
+}
+
+function ensureWorkingData() {
+  const mip = computeMipLevel();
+  if (mip === workingMip && workingCanvas) return;
+
+  workingMip = mip;
+  const w = Math.max(1, Math.round(srcImage.width * mip));
+  const h = Math.max(1, Math.round(srcImage.height * mip));
+
+  workingCanvas = document.createElement('canvas');
+  workingCanvas.width = w;
+  workingCanvas.height = h;
+  const ctx = workingCanvas.getContext('2d');
+
+  if (cvReady && mip < 1) {
+    // OpenCV INTER_AREA: area-based downsampling (higher quality than browser bilinear)
+    // + CV grayscale extraction in the same pass
+    const tmp = document.createElement('canvas');
+    tmp.width = srcImage.width; tmp.height = srcImage.height;
+    tmp.getContext('2d').drawImage(srcImage, 0, 0);
+    const fullData = tmp.getContext('2d').getImageData(0, 0, srcImage.width, srcImage.height);
+    const full = cv.matFromImageData(fullData);
+    const dst = new cv.Mat();
+    const gray = new cv.Mat();
+    try {
+      cv.resize(full, dst, new cv.Size(w, h), 0, 0, cv.INTER_AREA);
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(dst.data), w, h), 0, 0);
+      cv.cvtColor(dst, gray, cv.COLOR_RGBA2GRAY);
+      workingGray = new Uint8Array(gray.data);
+    } finally {
+      full.delete(); dst.delete(); gray.delete();
+    }
+  } else {
+    // Fallback: browser GPU resampling + JS grayscale (also used for mip === 1, no resize)
+    ctx.drawImage(srcImage, 0, 0, w, h);
+    const id = ctx.getImageData(0, 0, w, h);
+    const d = id.data;
+    workingGray = new Uint8Array(w * h);
+    for (let i = 0; i < workingGray.length; i++) {
+      workingGray[i] = Math.round(0.299 * d[i*4] + 0.587 * d[i*4+1] + 0.114 * d[i*4+2]);
+    }
+  }
+
+  // Working data changed → all filter caches are stale
+  invalidateAllFilters();
+}
+
+function invalidateFilter(idx) {
+  filterCacheKeys[idx] = '';
+  filterResults[idx] = null;
+}
+function invalidateAllFilters() {
+  for (let i = 0; i < PANEL_COUNT; i++) invalidateFilter(i);
+}
+
+// ---- Rendering ----
+let renderRAF = null;
+
+function scheduleRender() {
+  if (!renderRAF) renderRAF = requestAnimationFrame(() => { renderRAF = null; renderAll(); });
+}
+
+/** Full render: recompute working data & filters if needed, then draw. */
+function renderAll() {
+  if (!srcImage) return;
+  ensureWorkingData();
+  for (let i = 0; i < PANEL_COUNT; i++) {
+    ensureFilter(i);
+    drawPanel(i);
+  }
+}
+
+/** Fast redraw: use cached filter results, just redraw canvases. For pan/annotation. */
+function renderView() {
+  if (!srcImage) return;
+  for (let i = 0; i < PANEL_COUNT; i++) drawPanel(i);
+}
+
+function ensureFilter(idx) {
+  const key = idx + '_' + getFilterKey(idx) + '_' + workingMip;
+  if (filterCacheKeys[idx] === key && filterResults[idx]) return;
+  filterResults[idx] = idx === 0
+    ? applyBCToCanvas(workingCanvas, panelBC[0])
+    : computeFilter(idx);
+  filterCacheKeys[idx] = key;
+}
+
+function drawPanel(idx) {
+  const canvas = canvases[idx];
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const rect = panels[idx].getBoundingClientRect();
+  ctx.clearRect(0, 0, rect.width, rect.height);
+
+  ctx.save();
+  if (flippedH) {
+    ctx.translate(rect.width, 0);
+    ctx.scale(-1, 1);
+  }
+  ctx.translate(view.x, view.y);
+  ctx.scale(view.scale, view.scale);
+
+  // Draw the image scaled to original image dimensions
+  // (workingCanvas / filterResults are at mip resolution; drawImage stretches them)
+  const imgToDraw = filterResults[idx] || (idx === 0 ? workingCanvas : null);
+  if (imgToDraw) {
+    ctx.imageSmoothingEnabled = (view.scale * workingMip) < 2;
+    ctx.drawImage(imgToDraw, 0, 0, srcImage.width, srcImage.height);
+  }
+
+  // Draw annotations (in image coordinate space)
+  if (annotationsVisible) {
+    for (const a of annotations) drawAnnotation(ctx, a);
+  }
+  if (drawState) drawAnnotation(ctx, drawState);
+
+  ctx.restore();
+}
+
+function drawMeasureAnnotation(ctx, a) {
+  if (a.points.length < 2) return;
+  const [ax, ay] = a.points[0];
+  const [bx, by] = a.points[1];
+  const refLen = Math.hypot(bx - ax, by - ay);
+  if (refLen < 0.5) return;
+
+  const tickHalf = 10 / view.scale; // 20px total in screen space
+  const drawTick = (tx, ty, perpX, perpY) => {
+    ctx.beginPath();
+    ctx.moveTo(tx - perpX * tickHalf, ty - perpY * tickHalf);
+    ctx.lineTo(tx + perpX * tickHalf, ty + perpY * tickHalf);
+    ctx.stroke();
+  };
+
+  if (a.points.length < 3) {
+    // Phase 1 preview: reference line with endpoint ticks perpendicular to AB
+    const ux = (bx - ax) / refLen, uy = (by - ay) / refLen;
+    const perpX = -uy, perpY = ux;
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+    drawTick(ax, ay, perpX, perpY);
+    drawTick(bx, by, perpX, perpY);
+    return;
+  }
+
+  // Phase 2: extended line with ticks perpendicular to AC
+  const [cx, cy] = a.points[2];
+  const dx = cx - ax, dy = cy - ay;
+  const totalLen = Math.hypot(dx, dy);
+  if (totalLen < 0.5) return;
+  const ux = dx / totalLen, uy = dy / totalLen;
+  const perpX = -uy, perpY = ux;
+  const numTicks = Math.floor(totalLen / refLen);
+
+  // Main line: extend backward if bidirectional
+  const startX = a.bidirectional ? ax - dx : ax;
+  const startY = a.bidirectional ? ay - dy : ay;
+  ctx.beginPath();
+  ctx.moveTo(startX, startY);
+  ctx.lineTo(cx, cy);
+  ctx.stroke();
+
+  // Forward ticks: A (n=0), intervals n=1..numTicks (skip if at extEnd), plus actual B if off-grid
+  drawTick(ax, ay, perpX, perpY);
+  for (let n = 1; n <= numTicks; n++) {
+    const t = n * refLen;
+    if (totalLen - t < 0.5) continue; // coincides with extEnd — skip
+    drawTick(ax + ux * t, ay + uy * t, perpX, perpY);
+  }
+  // Backward ticks if bidirectional: symmetric intervals + backward endpoint
+  if (a.bidirectional) {
+    for (let n = 1; n <= numTicks; n++) {
+      const t = n * refLen;
+      if (totalLen - t < 0.5) continue; // coincides with backward endpoint — skip
+      drawTick(ax - ux * t, ay - uy * t, perpX, perpY);
+    }
+    drawTick(startX, startY, perpX, perpY);
+  }
+}
+
+function drawAnnotation(ctx, a) {
+  if (a.points.length < 1) return;
+  ctx.strokeStyle = a.color;
+  ctx.lineWidth = a.width / view.scale;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  if (a.type === 'measure') {
+    drawMeasureAnnotation(ctx, a);
+    return;
+  }
+  ctx.beginPath();
+  if (a.type === 'oval') {
+    if (a.points.length < 2) return;
+    let cx, cy, rx, ry;
+    if (a.fromCenter) {
+      cx = a.points[0][0]; cy = a.points[0][1];
+      rx = Math.abs(a.points[1][0] - a.points[0][0]);
+      ry = Math.abs(a.points[1][1] - a.points[0][1]);
+    } else {
+      cx = (a.points[0][0] + a.points[1][0]) / 2;
+      cy = (a.points[0][1] + a.points[1][1]) / 2;
+      rx = Math.abs(a.points[1][0] - a.points[0][0]) / 2;
+      ry = Math.abs(a.points[1][1] - a.points[0][1]) / 2;
+    }
+    if (rx === 0 || ry === 0) return;
+    ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  } else {
+    ctx.moveTo(a.points[0][0], a.points[0][1]);
+    if (a.type === 'line' && a.points.length === 2) {
+      ctx.lineTo(a.points[1][0], a.points[1][1]);
+    } else {
+      for (let i = 1; i < a.points.length; i++) ctx.lineTo(a.points[i][0], a.points[i][1]);
+    }
+  }
+  ctx.stroke();
+}
+
+// ---- Erase ----
+function pointToSegmentDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const lenSq = dx*dx + dy*dy;
+  if (lenSq === 0) return Math.hypot(px - ax, py - ay);
+  const t = Math.max(0, Math.min(1, ((px-ax)*dx + (py-ay)*dy) / lenSq));
+  return Math.hypot(px - (ax + t*dx), py - (ay + t*dy));
+}
+
+function eraseAnnotationAt(ix, iy) {
+  const extraTol = 8 / view.scale; // 8 screen-pixel buffer in image coords
+  let minDist = Infinity, minIdx = -1;
+  for (let ai = 0; ai < annotations.length; ai++) {
+    const a = annotations[ai];
+    const hitTol = a.width / 2 / view.scale + extraTol;
+    const pts = a.points;
+    let dist;
+    if (a.type === 'measure' && pts.length >= 3) {
+      // Bidirectional: line spans from mirror of extEnd through refStart to extEnd
+      const [ax, ay] = pts[0], [cx, cy] = pts[2];
+      const startX = a.bidirectional ? 2 * ax - cx : ax;
+      const startY = a.bidirectional ? 2 * ay - cy : ay;
+      dist = pointToSegmentDist(ix, iy, startX, startY, cx, cy);
+    } else if (a.type === 'oval' && pts.length >= 2) {
+      let ecx, ecy, erx, ery;
+      if (a.fromCenter) {
+        ecx = pts[0][0]; ecy = pts[0][1];
+        erx = Math.abs(pts[1][0] - pts[0][0]); ery = Math.abs(pts[1][1] - pts[0][1]);
+      } else {
+        ecx = (pts[0][0] + pts[1][0]) / 2; ecy = (pts[0][1] + pts[1][1]) / 2;
+        erx = Math.abs(pts[1][0] - pts[0][0]) / 2; ery = Math.abs(pts[1][1] - pts[0][1]) / 2;
+      }
+      if (erx > 0 && ery > 0) {
+        const theta = Math.atan2((iy - ecy) / ery, (ix - ecx) / erx);
+        dist = Math.hypot(ix - (ecx + erx * Math.cos(theta)), iy - (ecy + ery * Math.sin(theta)));
+      } else {
+        dist = Math.hypot(ix - ecx, iy - ecy);
+      }
+    } else {
+      dist = pts.length === 1
+        ? Math.hypot(ix - pts[0][0], iy - pts[0][1])
+        : Infinity;
+      for (let pi = 0; pi < pts.length - 1; pi++) {
+        dist = Math.min(dist, pointToSegmentDist(ix, iy, pts[pi][0], pts[pi][1], pts[pi+1][0], pts[pi+1][1]));
+      }
+    }
+    if (dist < hitTol && dist < minDist) { minDist = dist; minIdx = ai; }
+  }
+  if (minIdx >= 0) { annotations.splice(minIdx, 1); return true; }
+  return false;
+}
+
+// ---- Brightness / Contrast ----
+function applyBCToCanvas(srcCanvas, { brightness, contrast }) {
+  if (!srcCanvas) return null;
+  if (brightness === 0 && contrast === 0) return srcCanvas;
+  const w = srcCanvas.width, h = srcCanvas.height;
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d');
+  const alpha = 1 + contrast / 100;
+  const beta = brightness;
+  if (cvReady) {
+    const imgData = srcCanvas.getContext('2d').getImageData(0, 0, w, h);
+    const src = cv.matFromImageData(imgData);
+    const dst = new cv.Mat();
+    try {
+      src.convertTo(dst, -1, alpha, beta);
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(dst.data), w, h), 0, 0);
+    } finally {
+      src.delete(); dst.delete();
+    }
+  } else {
+    ctx.drawImage(srcCanvas, 0, 0);
+    const id = ctx.getImageData(0, 0, w, h);
+    const d = id.data;
+    for (let i = 0; i < d.length; i += 4) {
+      d[i]   = Math.max(0, Math.min(255, Math.round(alpha * d[i]   + beta)));
+      d[i+1] = Math.max(0, Math.min(255, Math.round(alpha * d[i+1] + beta)));
+      d[i+2] = Math.max(0, Math.min(255, Math.round(alpha * d[i+2] + beta)));
+    }
+    ctx.putImageData(id, 0, 0);
+  }
+  return c;
+}
+
+// ---- Filter computation (at working resolution) ----
+function computeFilter(idx) {
+  const w = workingCanvas.width, h = workingCanvas.height;
+
+  if (idx === 1) {
+    // Grayscale + B/C
+    let c;
+    if (cvReady) {
+      c = computeGrayscaleCV(w, h);
+    } else {
+      c = document.createElement('canvas'); c.width = w; c.height = h;
+      const ctx = c.getContext('2d');
+      const id = ctx.createImageData(w, h); const d = id.data;
+      for (let i = 0; i < workingGray.length; i++) {
+        const v = workingGray[i];
+        d[i*4] = v; d[i*4+1] = v; d[i*4+2] = v; d[i*4+3] = 255;
+      }
+      ctx.putImageData(id, 0, 0);
+    }
+    return applyBCToCanvas(c, panelBC[1]);
+  }
+
+  if (idx === 2) {
+    // Binary
+    const thresh = parseInt(document.getElementById('binThresh').value);
+    if (cvReady) return computeBinaryCV(w, h, thresh);
+    // JS fallback
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    const id = ctx.createImageData(w, h); const d = id.data;
+    for (let i = 0; i < workingGray.length; i++) {
+      const v = workingGray[i] >= thresh ? 255 : 0;
+      d[i*4] = v; d[i*4+1] = v; d[i*4+2] = v; d[i*4+3] = 255;
+    }
+    ctx.putImageData(id, 0, 0);
+    return c;
+  }
+
+  if (idx === 3) {
+    // Edge (Sobel)
+    const thresh = parseInt(document.getElementById('edgeThresh').value);
+    if (cvReady) return computeEdgeCV(w, h, thresh);
+    // JS fallback
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    const id = ctx.createImageData(w, h); const d = id.data;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let gx = 0, gy = 0;
+        if (x > 0 && x < w-1 && y > 0 && y < h-1) {
+          const g = (ox, oy) => workingGray[(y+oy)*w + (x+ox)];
+          gx = -g(-1,-1) + g(1,-1) - 2*g(-1,0) + 2*g(1,0) - g(-1,1) + g(1,1);
+          gy = -g(-1,-1) - 2*g(0,-1) - g(1,-1) + g(-1,1) + 2*g(0,1) + g(1,1);
+        }
+        const mag = Math.sqrt(gx*gx + gy*gy);
+        const v = mag > thresh ? Math.min(255, Math.round(mag)) : 0;
+        const pi = (y*w + x)*4;
+        d[pi] = v; d[pi+1] = v; d[pi+2] = v; d[pi+3] = 255;
+      }
+    }
+    ctx.putImageData(id, 0, 0);
+    return c;
+  }
+
+  if (idx === 4) {
+    // Blur
+    const type = document.getElementById('blurType').value;
+    const radius = parseInt(document.getElementById('blurRadius').value);
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    ctx.drawImage(workingCanvas, 0, 0);
+    applyBlur(ctx, w, h, radius, type);
+    return c;
+  }
+
+  if (idx === 5) {
+    // Reduce Color (k-means)
+    const k = parseInt(document.getElementById('reduceColors').value);
+    if (cvReady) return computeReduceColorCV(w, h, k);
+    return computeReduceColorJS(w, h, k);
+  }
+}
+
+function getFilterKey(idx) {
+  if (idx === 0) return panelBC[0].brightness + '_' + panelBC[0].contrast;
+  if (idx === 1) return panelBC[1].brightness + '_' + panelBC[1].contrast;
+  if (idx === 2) return document.getElementById('binThresh').value;
+  if (idx === 3) return document.getElementById('edgeThresh').value;
+  if (idx === 4) return document.getElementById('blurType').value + '_' + document.getElementById('blurRadius').value;
+  if (idx === 5) return document.getElementById('reduceColors').value;
+  return '';
+}
+
+// ---- Grayscale (OpenCV with JS fallback) ----
+function computeGrayscaleCV(w, h) {
+  const imgData = workingCanvas.getContext('2d').getImageData(0, 0, w, h);
+  const src = cv.matFromImageData(imgData);
+  const gray = new cv.Mat();
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    const n = w * h;
+    const d = new Uint8ClampedArray(n * 4);
+    const gd = gray.data;
+    for (let i = 0; i < n; i++) {
+      const v = gd[i];
+      d[i*4] = v; d[i*4+1] = v; d[i*4+2] = v; d[i*4+3] = 255;
+    }
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    c.getContext('2d').putImageData(new ImageData(d, w, h), 0, 0);
+    return c;
+  } finally {
+    src.delete(); gray.delete();
+  }
+}
+
+// ---- Binary (OpenCV with JS fallback) ----
+function computeBinaryCV(w, h, thresh) {
+  const imgData = workingCanvas.getContext('2d').getImageData(0, 0, w, h);
+  const src = cv.matFromImageData(imgData);
+  const gray = new cv.Mat();
+  const binary = new cv.Mat();
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.threshold(gray, binary, thresh, 255, cv.THRESH_BINARY);
+    const n = w * h;
+    const d = new Uint8ClampedArray(n * 4);
+    const bd = binary.data;
+    for (let i = 0; i < n; i++) {
+      const v = bd[i];
+      d[i*4] = v; d[i*4+1] = v; d[i*4+2] = v; d[i*4+3] = 255;
+    }
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    c.getContext('2d').putImageData(new ImageData(d, w, h), 0, 0);
+    return c;
+  } finally {
+    src.delete(); gray.delete(); binary.delete();
+  }
+}
+
+// ---- Edge / Sobel (OpenCV with JS fallback) ----
+function computeEdgeCV(w, h, thresh) {
+  const imgData = workingCanvas.getContext('2d').getImageData(0, 0, w, h);
+  const src = cv.matFromImageData(imgData);
+  const gray = new cv.Mat();
+  const gx = new cv.Mat();
+  const gy = new cv.Mat();
+  const mag = new cv.Mat();
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.Sobel(gray, gx, cv.CV_32F, 1, 0, 3);
+    cv.Sobel(gray, gy, cv.CV_32F, 0, 1, 3);
+    cv.magnitude(gx, gy, mag);
+    const n = w * h;
+    const magF = mag.data32F;
+    const d = new Uint8ClampedArray(n * 4);
+    for (let i = 0; i < n; i++) {
+      const v = magF[i] > thresh ? Math.min(255, Math.round(magF[i])) : 0;
+      d[i*4] = v; d[i*4+1] = v; d[i*4+2] = v; d[i*4+3] = 255;
+    }
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    c.getContext('2d').putImageData(new ImageData(d, w, h), 0, 0);
+    return c;
+  } finally {
+    src.delete(); gray.delete(); gx.delete(); gy.delete(); mag.delete();
+  }
+}
+
+// ---- Blur (OpenCV.js with JS fallback) ----
+function applyBlur(ctx, w, h, radius, type) {
+  if (cvReady) {
+    applyBlurCV(ctx, w, h, radius, type);
+  } else {
+    applyBlurFallback(ctx, w, h, radius);
+  }
+}
+
+function applyBlurCV(ctx, w, h, radius, type) {
+  const imgData = ctx.getImageData(0, 0, w, h);
+  const src = cv.matFromImageData(imgData);
+  const dst = new cv.Mat();
+  const ksize = radius * 2 + 1;
+
+  try {
+    if (type === 'box') {
+      cv.blur(src, dst, new cv.Size(ksize, ksize));
+    } else if (type === 'gaussian') {
+      cv.GaussianBlur(src, dst, new cv.Size(ksize, ksize), 0);
+    } else if (type === 'median') {
+      cv.medianBlur(src, dst, ksize);
+    } else if (type === 'bilateral') {
+      // bilateralFilter requires 1 or 3 channels, not 4
+      const src3 = new cv.Mat();
+      const dst3 = new cv.Mat();
+      cv.cvtColor(src, src3, cv.COLOR_RGBA2RGB);
+      cv.bilateralFilter(src3, dst3, ksize, 75, 75);
+      cv.cvtColor(dst3, dst, cv.COLOR_RGB2RGBA);
+      src3.delete();
+      dst3.delete();
+    }
+
+    const outData = new ImageData(new Uint8ClampedArray(dst.data), w, h);
+    ctx.putImageData(outData, 0, 0);
+  } finally {
+    src.delete();
+    if (!dst.isDeleted()) dst.delete();
+  }
+}
+
+// JS Gaussian fallback used while OpenCV is loading
+function applyBlurFallback(ctx, w, h, radius) {
+  const id = ctx.getImageData(0, 0, w, h);
+  const src = new Uint8ClampedArray(id.data);
+  const dst = id.data;
+  const sigma = Math.max(radius / 2.5, 0.5);
+  const size = radius * 2 + 1;
+  const kernel = new Float32Array(size);
+  let sum = 0;
+  for (let i = 0; i < size; i++) {
+    const x = i - radius;
+    kernel[i] = Math.exp(-(x * x) / (2 * sigma * sigma));
+    sum += kernel[i];
+  }
+  for (let i = 0; i < size; i++) kernel[i] /= sum;
+
+  const tmp = new Float32Array(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let sr = 0, sg = 0, sb = 0;
+      for (let ki = 0; ki < size; ki++) {
+        const sx = Math.min(w - 1, Math.max(0, x + ki - radius));
+        const i = (y * w + sx) * 4;
+        sr += src[i] * kernel[ki]; sg += src[i+1] * kernel[ki]; sb += src[i+2] * kernel[ki];
+      }
+      const i = (y * w + x) * 4;
+      tmp[i] = sr; tmp[i+1] = sg; tmp[i+2] = sb;
+    }
+  }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let sr = 0, sg = 0, sb = 0;
+      for (let ki = 0; ki < size; ki++) {
+        const sy = Math.min(h - 1, Math.max(0, y + ki - radius));
+        const i = (sy * w + x) * 4;
+        sr += tmp[i] * kernel[ki]; sg += tmp[i+1] * kernel[ki]; sb += tmp[i+2] * kernel[ki];
+      }
+      const i = (y * w + x) * 4;
+      dst[i] = Math.round(sr); dst[i+1] = Math.round(sg); dst[i+2] = Math.round(sb); dst[i+3] = 255;
+    }
+  }
+  ctx.putImageData(id, 0, 0);
+}
+
+// ---- Reduce Color (OpenCV k-means with JS fallback) ----
+function computeReduceColorCV(w, h, k) {
+  const n = w * h;
+  const imgData = workingCanvas.getContext('2d').getImageData(0, 0, w, h);
+  const src = cv.matFromImageData(imgData);
+  const src3 = new cv.Mat();
+  const kmeansData = new cv.Mat(n, 3, cv.CV_32F);
+  const labels = new cv.Mat();
+  const centers = new cv.Mat();
+  try {
+    cv.cvtColor(src, src3, cv.COLOR_RGBA2RGB);
+    // Copy RGB pixels into float mat (n rows × 3 cols) for kmeans
+    const rgb = src3.data;
+    const kd = kmeansData.data32F;
+    for (let i = 0; i < n * 3; i++) kd[i] = rgb[i];
+
+    const criteria = new cv.TermCriteria(
+      cv.TermCriteria_EPS + cv.TermCriteria_MAX_ITER, 10, 1.0
+    );
+    cv.kmeans(kmeansData, k, labels, criteria, 1, cv.KMEANS_PP_CENTERS, centers);
+
+    const labelsI = labels.data32S;
+    const centersF = centers.data32F;
+    const out = document.createElement('canvas');
+    out.width = w; out.height = h;
+    const ctx = out.getContext('2d');
+    const outId = ctx.createImageData(w, h);
+    const d = outId.data;
+    for (let i = 0; i < n; i++) {
+      const ci = labelsI[i];
+      d[i*4]   = Math.round(centersF[ci*3]);
+      d[i*4+1] = Math.round(centersF[ci*3+1]);
+      d[i*4+2] = Math.round(centersF[ci*3+2]);
+      d[i*4+3] = 255;
+    }
+    ctx.putImageData(outId, 0, 0);
+    return out;
+  } finally {
+    src.delete(); src3.delete(); kmeansData.delete();
+    if (!labels.isDeleted()) labels.delete();
+    if (!centers.isDeleted()) centers.delete();
+  }
+}
+
+function computeReduceColorJS(w, h, k) {
+  const n = w * h;
+  const srcCtx = workingCanvas.getContext('2d');
+  const srcId = srcCtx.getImageData(0, 0, w, h);
+  const src = srcId.data;
+
+  // Extract RGB into flat array
+  const pixels = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    pixels[i*3] = src[i*4]; pixels[i*3+1] = src[i*4+1]; pixels[i*3+2] = src[i*4+2];
+  }
+
+  // Subsample for k-means speed
+  const step = Math.max(1, Math.floor(Math.sqrt(n / 5000)));
+  const sampleIdx = [];
+  for (let i = 0; i < n; i += step) sampleIdx.push(i);
+  const sn = sampleIdx.length;
+
+  // K-means++ init (max-distance, deterministic)
+  const centroids = new Float32Array(k * 3);
+  centroids[0] = pixels[sampleIdx[0]*3];
+  centroids[1] = pixels[sampleIdx[0]*3+1];
+  centroids[2] = pixels[sampleIdx[0]*3+2];
+  const dists = new Float32Array(sn);
+  for (let c = 1; c < k; c++) {
+    let maxD = -1, maxSi = 0;
+    for (let si = 0; si < sn; si++) {
+      const pi = sampleIdx[si] * 3;
+      const dr = pixels[pi] - centroids[(c-1)*3];
+      const dg = pixels[pi+1] - centroids[(c-1)*3+1];
+      const db = pixels[pi+2] - centroids[(c-1)*3+2];
+      const d = dr*dr + dg*dg + db*db;
+      dists[si] = c === 1 ? d : Math.min(dists[si], d);
+      if (dists[si] > maxD) { maxD = dists[si]; maxSi = si; }
+    }
+    const pi = sampleIdx[maxSi] * 3;
+    centroids[c*3] = pixels[pi]; centroids[c*3+1] = pixels[pi+1]; centroids[c*3+2] = pixels[pi+2];
+  }
+
+  // K-means iterations on subsample
+  const sAssign = new Uint16Array(sn);
+  for (let iter = 0; iter < 10; iter++) {
+    for (let si = 0; si < sn; si++) {
+      const pi = sampleIdx[si] * 3;
+      let minD = Infinity, minC = 0;
+      for (let c = 0; c < k; c++) {
+        const dr = pixels[pi] - centroids[c*3];
+        const dg = pixels[pi+1] - centroids[c*3+1];
+        const db = pixels[pi+2] - centroids[c*3+2];
+        const d = dr*dr + dg*dg + db*db;
+        if (d < minD) { minD = d; minC = c; }
+      }
+      sAssign[si] = minC;
+    }
+    const sums = new Float32Array(k * 3);
+    const counts = new Uint32Array(k);
+    for (let si = 0; si < sn; si++) {
+      const c = sAssign[si];
+      const pi = sampleIdx[si] * 3;
+      sums[c*3] += pixels[pi]; sums[c*3+1] += pixels[pi+1]; sums[c*3+2] += pixels[pi+2];
+      counts[c]++;
+    }
+    for (let c = 0; c < k; c++) {
+      if (counts[c] > 0) {
+        centroids[c*3] = sums[c*3]/counts[c];
+        centroids[c*3+1] = sums[c*3+1]/counts[c];
+        centroids[c*3+2] = sums[c*3+2]/counts[c];
+      }
+    }
+  }
+
+  // Assign all pixels to nearest centroid
+  const out = document.createElement('canvas');
+  out.width = w; out.height = h;
+  const ctx = out.getContext('2d');
+  const outId = ctx.createImageData(w, h);
+  const d = outId.data;
+  for (let i = 0; i < n; i++) {
+    const pi = i * 3;
+    let minD = Infinity, minC = 0;
+    for (let c = 0; c < k; c++) {
+      const dr = pixels[pi] - centroids[c*3];
+      const dg = pixels[pi+1] - centroids[c*3+1];
+      const db = pixels[pi+2] - centroids[c*3+2];
+      const dd = dr*dr + dg*dg + db*db;
+      if (dd < minD) { minD = dd; minC = c; }
+    }
+    d[i*4]   = Math.round(centroids[minC*3]);
+    d[i*4+1] = Math.round(centroids[minC*3+1]);
+    d[i*4+2] = Math.round(centroids[minC*3+2]);
+    d[i*4+3] = 255;
+  }
+  ctx.putImageData(outId, 0, 0);
+  return out;
+}
+
+// ---- Solo view ----
+function enterSolo(idx) {
+  if (soloTransitioning) return;
+  soloTransitioning = true;
+
+  document.querySelectorAll('.btn-expand').forEach((btn, i) => {
+    btn.textContent = i === idx ? '✕' : '⛶';
+    btn.title = i === idx ? 'グリッドビューに戻る' : '単体表示';
+  });
+
+  // Phase 1: fade out all panels to hide the layout jump
+  panels.forEach(p => { p.style.pointerEvents = 'none'; p.style.opacity = '0'; });
+
+  setTimeout(() => {
+    soloPanel = idx;
+    document.getElementById('grid').classList.add('solo');
+    panels.forEach((p, i) => p.classList.toggle('solo-active', i === idx));
+    resizeCanvases();
+    resetView();
+    renderAll();
+
+    // Phase 2: animate solo panel in with scale + fade
+    const p = panels[idx];
+    p.style.transition = 'none';
+    p.style.transform = 'scale(0.97)';
+    // opacity stays 0 from phase 1
+    void p.getBoundingClientRect(); // force reflow before re-enabling transition
+    p.style.transition = '';
+    p.style.opacity = '1';
+    p.style.transform = '';
+
+    setTimeout(() => {
+      p.style.pointerEvents = '';
+      soloTransitioning = false;
+    }, SOLO_FADE_MS);
+  }, SOLO_FADE_MS);
+}
+
+function exitSolo() {
+  if (soloTransitioning) return;
+  soloTransitioning = true;
+
+  const prevIdx = soloPanel;
+  panels[prevIdx].style.pointerEvents = 'none';
+  panels[prevIdx].style.opacity = '0';
+
+  setTimeout(() => {
+    soloPanel = null;
+    document.getElementById('grid').classList.remove('solo');
+    panels.forEach(p => {
+      p.classList.remove('solo-active');
+      p.style.transition = 'none';
+      p.style.opacity = '0';
+      p.style.pointerEvents = 'none';
+    });
+    document.querySelectorAll('.btn-expand').forEach(btn => {
+      btn.textContent = '⛶';
+      btn.title = '単体表示';
+    });
+    resizeCanvases();
+    resetView();
+    renderAll();
+
+    // Phase 2: fade in all panels
+    void document.getElementById('grid').getBoundingClientRect(); // force reflow
+    panels.forEach(p => {
+      p.style.transition = '';
+      p.style.opacity = '1';
+    });
+
+    setTimeout(() => {
+      panels.forEach(p => { p.style.pointerEvents = ''; });
+      soloTransitioning = false;
+    }, SOLO_FADE_MS);
+  }, SOLO_FADE_MS);
+}
+
+// ---- Controls ----
+document.getElementById('p0Bright').addEventListener('input', e => {
+  document.getElementById('p0BrightVal').textContent = e.target.value;
+  panelBC[0].brightness = parseInt(e.target.value);
+  invalidateFilter(0);
+  scheduleRender();
+});
+document.getElementById('p0Contrast').addEventListener('input', e => {
+  document.getElementById('p0ContrastVal').textContent = e.target.value;
+  panelBC[0].contrast = parseInt(e.target.value);
+  invalidateFilter(0);
+  scheduleRender();
+});
+document.getElementById('p1Bright').addEventListener('input', e => {
+  document.getElementById('p1BrightVal').textContent = e.target.value;
+  panelBC[1].brightness = parseInt(e.target.value);
+  invalidateFilter(1);
+  scheduleRender();
+});
+document.getElementById('p1Contrast').addEventListener('input', e => {
+  document.getElementById('p1ContrastVal').textContent = e.target.value;
+  panelBC[1].contrast = parseInt(e.target.value);
+  invalidateFilter(1);
+  scheduleRender();
+});
+document.getElementById('binThresh').addEventListener('input', e => {
+  document.getElementById('binVal').textContent = e.target.value;
+  invalidateFilter(2);
+  scheduleRender();
+});
+document.getElementById('edgeThresh').addEventListener('input', e => {
+  document.getElementById('edgeVal').textContent = e.target.value;
+  invalidateFilter(3);
+  scheduleRender();
+});
+document.getElementById('blurRadius').addEventListener('input', e => {
+  document.getElementById('blurRadiusVal').textContent = e.target.value;
+  invalidateFilter(4);
+  scheduleRender();
+});
+document.getElementById('blurType').addEventListener('change', () => { invalidateFilter(4); scheduleRender(); });
+document.getElementById('reduceColors').addEventListener('input', e => {
+  document.getElementById('reduceColorsVal').textContent = e.target.value;
+  invalidateFilter(5);
+  scheduleRender();
+});
+document.getElementById('btnFlipH').addEventListener('click', () => {
+  flippedH = !flippedH;
+  document.getElementById('btnFlipH').classList.toggle('active', flippedH);
+  renderView();
+});
+document.getElementById('btnResetView').addEventListener('click', () => { resetView(); renderAll(); });
+
+// ---- Cursor management ----
+// Custom cursor SVGs encoded as data URIs
+const CURSOR_ZOOM_IN = (() => {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+    <circle cx="10" cy="10" r="7" fill="none" stroke="white" stroke-width="2"/>
+    <circle cx="10" cy="10" r="7" fill="none" stroke="black" stroke-width="1"/>
+    <line x1="15.5" y1="15.5" x2="22" y2="22" stroke="white" stroke-width="3" stroke-linecap="round"/>
+    <line x1="15.5" y1="15.5" x2="22" y2="22" stroke="black" stroke-width="1.5" stroke-linecap="round"/>
+    <line x1="7" y1="10" x2="13" y2="10" stroke="black" stroke-width="1.5" stroke-linecap="round"/>
+    <line x1="10" y1="7" x2="10" y2="13" stroke="black" stroke-width="1.5" stroke-linecap="round"/>
+  </svg>`;
+  return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 10 10, zoom-in`;
+})();
+
+const CURSOR_ZOOM_OUT = (() => {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+    <circle cx="10" cy="10" r="7" fill="none" stroke="white" stroke-width="2"/>
+    <circle cx="10" cy="10" r="7" fill="none" stroke="black" stroke-width="1"/>
+    <line x1="15.5" y1="15.5" x2="22" y2="22" stroke="white" stroke-width="3" stroke-linecap="round"/>
+    <line x1="15.5" y1="15.5" x2="22" y2="22" stroke="black" stroke-width="1.5" stroke-linecap="round"/>
+    <line x1="7" y1="10" x2="13" y2="10" stroke="black" stroke-width="1.5" stroke-linecap="round"/>
+  </svg>`;
+  return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 10 10, zoom-out`;
+})();
+
+let spaceHeld = false;
+let altHeld = false;
+
+function getEffectiveTool() {
+  if (spaceHeld) return 'pan';
+  return currentTool;
+}
+
+function updateGridCursor() {
+  const grid = document.getElementById('grid');
+  const tool = getEffectiveTool();
+  switch (tool) {
+    case 'pan':  grid.style.cursor = isPanning ? 'grabbing' : 'grab'; break;
+    case 'zoom': grid.style.cursor = altHeld ? CURSOR_ZOOM_OUT : CURSOR_ZOOM_IN; break;
+    case 'line':  grid.style.cursor = 'crosshair'; break;
+    case 'free':  grid.style.cursor = 'crosshair'; break;
+    case 'oval':  grid.style.cursor = 'crosshair'; break;
+    case 'measure': grid.style.cursor = 'crosshair'; break;
+    case 'erase': grid.style.cursor = 'cell'; break;
+    default:     grid.style.cursor = 'default';
+  }
+}
+
+// ---- Keyboard state for Space (temp pan) and Alt (zoom-out) ----
+document.addEventListener('keydown', e => {
+  if (e.key === ' ' && !spaceHeld) {
+    e.preventDefault();
+    spaceHeld = true;
+    updateGridCursor();
+  }
+  if (e.key === 'Alt') {
+    altHeld = true;
+    updateGridCursor();
+  }
+});
+document.addEventListener('keyup', e => {
+  if (e.key === ' ') {
+    spaceHeld = false;
+    updateGridCursor();
+  }
+  if (e.key === 'Alt') {
+    altHeld = false;
+    updateGridCursor();
+  }
+});
+// Reset modifier state when window loses focus
+window.addEventListener('blur', () => {
+  spaceHeld = false;
+  altHeld = false;
+  updateGridCursor();
+});
+
+// Tool buttons
+document.querySelectorAll('#toolbar button[data-tool]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#toolbar button[data-tool]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentTool = btn.dataset.tool;
+    // Cancel in-progress measurement when switching away from Measure tool
+    if (currentTool !== 'measure' && (measureState || (drawState && drawState.type === 'measure'))) {
+      measureState = null;
+      drawState = null;
+      renderView();
+    }
+    updateGridCursor();
+  });
+});
+
+document.getElementById('btnUndo').addEventListener('click', () => {
+  if (measureState || (drawState && drawState.type === 'measure')) {
+    // Cancel in-progress measurement
+    measureState = null;
+    drawState = null;
+    renderView();
+  } else {
+    annotations.pop();
+    renderAll();
+  }
+});
+document.getElementById('btnClearAnnot').addEventListener('click', () => {
+  annotations = [];
+  renderAll();
+});
+document.getElementById('btnToggleAnnot').addEventListener('click', () => {
+  annotationsVisible = !annotationsVisible;
+  const btn = document.getElementById('btnToggleAnnot');
+  btn.textContent = annotationsVisible ? 'Hide' : 'Show';
+  btn.classList.toggle('active', !annotationsVisible);
+  renderView();
+});
+
+// ---- Pan / Zoom / Draw (synced across panels) ----
+let isPanning = false;
+let panStart = { x: 0, y: 0 };
+let isZooming = false; // zoom tool drag state
+
+function screenToImage(sx, sy, panelEl) {
+  const rect = panelEl.getBoundingClientRect();
+  let lx = sx - rect.left;
+  const ly = sy - rect.top;
+  if (flippedH) lx = rect.width - lx;
+  return [(lx - view.x) / view.scale, (ly - view.y) / view.scale];
+}
+
+function applyZoom(clientX, clientY, panelEl, zoomIn) {
+  const rect = panelEl.getBoundingClientRect();
+  let mx = clientX - rect.left;
+  const my = clientY - rect.top;
+  if (flippedH) mx = rect.width - mx;
+  const factor = zoomIn ? 1.5 : 1 / 1.5;
+  const newScale = view.scale * factor;
+  view.x = mx - (mx - view.x) * (newScale / view.scale);
+  view.y = my - (my - view.y) * (newScale / view.scale);
+  view.scale = newScale;
+  renderAll();
+}
+
+for (let i = 0; i < PANEL_COUNT; i++) {
+  const canvas = canvases[i];
+  const panel = panels[i];
+  const ptrMap = new Map(); // active pointers for pinch detection
+  let lastPinchDist = null;
+
+  canvas.addEventListener('pointerdown', e => {
+    if (!srcImage) return;
+    e.preventDefault();
+    canvas.setPointerCapture(e.pointerId);
+    ptrMap.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (ptrMap.size >= 2) {
+      // Switch to pinch-zoom; cancel any ongoing single-pointer interaction
+      isPanning = false;
+      drawState = null;
+      isErasing = false;
+      updateGridCursor();
+      const ptrs = [...ptrMap.values()];
+      lastPinchDist = Math.hypot(ptrs[1].x - ptrs[0].x, ptrs[1].y - ptrs[0].y);
+      return;
+    }
+
+    const tool = getEffectiveTool();
+
+    if (tool === 'pan') {
+      isPanning = true;
+      panStart = { x: (flippedH ? -e.clientX : e.clientX) - view.x, y: e.clientY - view.y };
+      updateGridCursor();
+    } else if (tool === 'zoom') {
+      // Click to zoom in/out instantly
+      const zoomIn = !e.altKey;
+      applyZoom(e.clientX, e.clientY, panel, zoomIn);
+      isZooming = true;
+    } else if (tool === 'erase') {
+      isErasing = true;
+      const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
+      if (eraseAnnotationAt(ix, iy)) renderView();
+    } else if (tool === 'measure') {
+      if (!measureState) {
+        // Phase 1: start drawing the reference line
+        const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
+        const color = document.getElementById('annotColor').value;
+        const width = parseInt(document.getElementById('annotWidth').value);
+        drawState = { type: 'measure', points: [[ix, iy], [ix, iy]], color, width };
+      }
+      // Phase 2: pointer down does nothing — pointerup will confirm
+    } else {
+      const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
+      const color = document.getElementById('annotColor').value;
+      const width = parseInt(document.getElementById('annotWidth').value);
+      if (tool === 'oval') {
+        drawState = { type: 'oval', points: [[ix, iy]], color, width, fromCenter: altHeld };
+      } else {
+        drawState = { type: tool === 'line' ? 'line' : 'free', points: [[ix, iy]], color, width };
+      }
+    }
+  });
+
+  canvas.addEventListener('pointermove', e => {
+    if (!srcImage) return;
+    ptrMap.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (ptrMap.size >= 2) {
+      // Pinch-zoom gesture
+      const ptrs = [...ptrMap.values()];
+      const dist = Math.hypot(ptrs[1].x - ptrs[0].x, ptrs[1].y - ptrs[0].y);
+      if (lastPinchDist !== null && lastPinchDist > 0) {
+        const factor = dist / lastPinchDist;
+        const rect = panel.getBoundingClientRect();
+        let mx = (ptrs[0].x + ptrs[1].x) / 2 - rect.left;
+        const my = (ptrs[0].y + ptrs[1].y) / 2 - rect.top;
+        if (flippedH) mx = rect.width - mx;
+        const oldMip = computeMipLevel();
+        const newScale = view.scale * factor;
+        view.x = mx - (mx - view.x) * (newScale / view.scale);
+        view.y = my - (my - view.y) * (newScale / view.scale);
+        view.scale = newScale;
+        if (computeMipLevel() !== oldMip) {
+          renderAll();
+        } else {
+          renderView();
+        }
+      }
+      lastPinchDist = dist;
+      return;
+    }
+
+    if (isPanning) {
+      view.x = (flippedH ? -e.clientX : e.clientX) - panStart.x;
+      view.y = e.clientY - panStart.y;
+      renderView(); // fast: no filter recomputation
+    } else if (isErasing) {
+      const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
+      if (eraseAnnotationAt(ix, iy)) renderView();
+    } else if (measureState) {
+      // Phase 2: show live preview of the extended measurement
+      const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
+      drawState = {
+        type: 'measure',
+        points: [measureState.refStart, measureState.refEnd, [ix, iy]],
+        color: measureState.color,
+        width: measureState.width,
+        bidirectional: altHeld,
+      };
+      renderView();
+    } else if (drawState) {
+      const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
+      if (drawState.type === 'line' || drawState.type === 'oval' || drawState.type === 'measure') {
+        drawState.points[1] = [ix, iy];
+      } else {
+        drawState.points.push([ix, iy]);
+      }
+      renderView(); // fast: no filter recomputation, shows live preview
+    }
+  });
+
+  canvas.addEventListener('pointerup', e => {
+    ptrMap.delete(e.pointerId);
+    if (ptrMap.size < 2) lastPinchDist = null;
+    if (ptrMap.size >= 1) return; // Wait for all pointers to lift
+
+    if (isPanning) {
+      isPanning = false;
+      updateGridCursor();
+    } else if (isZooming) {
+      isZooming = false;
+    } else if (isErasing) {
+      isErasing = false;
+    } else if (measureState) {
+      // Phase 2: confirm the extended measurement
+      const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
+      annotations.push({
+        type: 'measure',
+        points: [measureState.refStart, measureState.refEnd, [ix, iy]],
+        color: measureState.color,
+        width: measureState.width,
+        bidirectional: altHeld,
+      });
+      measureState = null;
+      drawState = null;
+      renderView();
+    } else if (drawState) {
+      const [ix, iy] = screenToImage(e.clientX, e.clientY, panel);
+      if (drawState.type === 'measure') {
+        // Phase 1 complete: reference line is set
+        drawState.points[1] = [ix, iy];
+        const [ax, ay] = drawState.points[0];
+        const [bx, by] = drawState.points[1];
+        const refLen = Math.hypot(bx - ax, by - ay);
+        if (refLen > 0.5) {
+          measureState = { refStart: [ax, ay], refEnd: [bx, by], color: drawState.color, width: drawState.width };
+          // Keep drawState so the reference line remains visible before first mousemove
+          drawState = { type: 'measure', points: [[ax, ay], [bx, by]], color: measureState.color, width: measureState.width };
+        } else {
+          drawState = null;
+        }
+      } else if (drawState.type === 'line' || drawState.type === 'oval') {
+        drawState.points[1] = [ix, iy];
+        if (drawState.points.length >= 2) annotations.push(drawState);
+        drawState = null;
+      } else {
+        drawState.points.push([ix, iy]);
+        if (drawState.points.length >= 2) annotations.push(drawState);
+        drawState = null;
+      }
+      renderView();
+    }
+  });
+
+  canvas.addEventListener('pointercancel', e => {
+    ptrMap.delete(e.pointerId);
+    if (ptrMap.size < 2) lastPinchDist = null;
+    if (ptrMap.size === 0) {
+      isPanning = false;
+      isErasing = false;
+      drawState = null;
+      updateGridCursor();
+    }
+  });
+
+  canvas.addEventListener('wheel', e => {
+    if (!srcImage) return;
+    e.preventDefault();
+    const rect = panel.getBoundingClientRect();
+    let mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    if (flippedH) mx = rect.width - mx;
+
+    const factor = e.deltaY < 0 ? 1.1 : 1/1.1;
+    const newScale = view.scale * factor;
+    const oldMip = computeMipLevel();
+
+    // Zoom toward mouse position
+    view.x = mx - (mx - view.x) * (newScale / view.scale);
+    view.y = my - (my - view.y) * (newScale / view.scale);
+    view.scale = newScale;
+
+    // Only recompute filters when crossing a mip level boundary
+    if (computeMipLevel() !== oldMip) {
+      renderAll();
+    } else {
+      renderView();
+    }
+  }, { passive: false });
+}
+
+// Set initial cursor
+updateGridCursor();
+
+// ---- Initial sizing ----
+requestAnimationFrame(resizeCanvases);

@@ -149,3 +149,60 @@
 ## デプロイ
 - GitHub Pages、Source は **GitHub Actions** に設定
 - `main` push で自動デプロイ
+
+## Capacitor（モバイルアプリ）
+
+### セットアップ済みファイル
+- `package.json` — npm スクリプト定義
+- `capacitor.config.ts` — appId は `APP_ID` 環境変数から取得（未設定時はエラー）、webDir `www`
+- `scripts/build.sh` — `www/` 生成スクリプト（index.html コピー + opencv.js 取得）
+- `ios/` / `android/` — Capacitor が生成したネイティブプロジェクト（Pods/ 等を除き git 管理）
+
+### ビルドコマンド
+```bash
+npm run build                              # www/ を生成（index.html + opencv.js）
+APP_ID=com.example.app npm run build:ios     # www/ 生成 + iOS 同期
+APP_ID=com.example.app npm run build:android # www/ 生成 + Android 同期
+npm run open:ios         # Xcode で開く
+npm run open:android     # Android Studio で開く
+npx cap sync             # www/ → ネイティブプロジェクトへ反映
+```
+
+### 初回セットアップ手順（新しいマシン）
+```bash
+npm install
+npm run build
+npx cap sync
+# Xcode または Android Studio でビルド・実行
+```
+
+> Capacitor 8 は Swift Package Manager (SPM) を使用するため CocoaPods 不要。
+
+### CI/CD（GitHub Actions）
+- `deploy.yml` — GitHub Pages デプロイ（変更なし）
+- `mobile-build.yml` — iOS/Android ビルド
+  - Android: 毎 push で unsigned AAB を Artifacts に保存
+  - iOS: シミュレータビルドでコンパイル検証
+  - iOS 配布 (IPA): Secrets（`BUILD_CERTIFICATE_BASE64` 等）を設定すると有効化
+
+### App Store リリースに必要な Secrets（GitHub リポジトリ設定）
+| Secret | 内容 |
+|--------|------|
+| `BUILD_CERTIFICATE_BASE64` | Distribution 証明書 (.p12) を base64 エンコード |
+| `P12_PASSWORD` | 証明書のパスワード |
+| `BUILD_PROVISION_PROFILE_BASE64` | App Store 配布用プロビジョニングプロファイル |
+| `KEYCHAIN_PASSWORD` | 一時キーチェーン用パスワード（任意の文字列） |
+| `APP_STORE_CONNECT_API_KEY_ID` | App Store Connect API Key ID |
+| `APP_STORE_CONNECT_API_ISSUER_ID` | API Issuer ID |
+| `APP_STORE_CONNECT_API_KEY_BASE64` | API Key (.p8) を base64 エンコード |
+
+### Google Play リリース手順（手動）
+1. `npm run build:android`
+2. `cd android && ./gradlew bundleRelease`
+3. 署名: `jarsigner` または Android Studio の Generate Signed Bundle
+4. Google Play Console にアップロード
+
+### セキュリティ注意事項
+- `server.url`（ライブリロード設定）はデバッグ時のみ使用し、リリース前に削除する
+- `cleartext: true` はリリースビルドに含めない
+- `BUILD_CERTIFICATE_BASE64` 等の Secrets は GitHub Secrets 経由で管理し、コードには含めない
