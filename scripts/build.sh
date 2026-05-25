@@ -3,8 +3,9 @@ set -e
 
 mkdir -p www
 
-# Copy index.html to www/
+# Copy web assets to www/
 cp index.html www/index.html
+cp app.js www/app.js
 
 # opencv.js: use local cache if present, otherwise download from GitHub Releases
 if [ -f opencv.js ]; then
